@@ -7,6 +7,11 @@ pyogrio==0.13.0
 shapely==2.1.2
 pyproj==3.7.2
 rasterio==1.5.1
+h3==4.5.0
+osmium==4.3.1
+
+# Mapping
+folium==0.20.0
 
 # Notebook execution (VS Code / Jupyter)
 ipykernel==7.3.0

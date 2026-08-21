@@ -1,0 +1,10 @@
+{
+  "chosen_resolution": 7,
+  "latest_quarter_used": "2026Q2",
+  "zones_latest_quarter": 1815,
+  "zones_all_quarters": 3400,
+  "median_tests_per_zone": 4.0,
+  "share_zones_tests_ge_30": 0.173,
+  "qoq_download_change_iqr": 1.036,
+  "justification": "Resolution 7 reproduces the brief's own cited density figures (median 4 tests/zone, ~83% of zones below 30 tests) on independently UAE-clipped data, yields a 'few hundred well-measured zones nationally' evidence pool consistent with the brief's expectation, and has quarter-over-quarter score stability close to resolution 6 while resolving far more granular zones for drill-down. Resolution 8 is confirmed too sparse to aggregate (mean 1.4 tiles/zone) and is reserved for display only."
+}
