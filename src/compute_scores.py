@@ -1,107 +1,125 @@
 """
-AI/ML & Analytics — Experience Index & Confidence Score
-Draft implementation, built ahead of real zone data landing from Data/GIS.
+Deterministic scoring pipeline: Experience Index, Confidence Score, and Peer Gap.
 
-Schema this expects, once Data/GIS delivers the real zone table (one row per zone per quarter):
-    zone_id            H3 cell id
-    zone_name          human-readable label
-    quarter             e.g. "2026Q2"
-    avg_d_kbps          average download speed, from Ookla
-    avg_u_kbps          average upload speed, from Ookla
-    avg_lat_ms          average latency, from Ookla
-    tests               test count this quarter, from Ookla
-    devices             distinct device count this quarter, from Ookla
-    quarters_observed   how many of the last 8 quarters this zone has any data in
-    population          estimated residents, from WorldPop
+Every function here is a pure, deterministic transformation on a pandas DataFrame -- same
+input, same output, every time. No ML and no LLM is involved anywhere in this file, per the
+brief's rule that these scores must be traceable, reproducible, and explainable on a slide.
 
-Everything below runs on synthetic sample data shaped like this schema. Swapping in the
-real zone table once it exists is a one-line change (see bottom of file) — nothing about
-the formulas themselves needs to change.
+Input shape expected: `data/processed/zone_quarter_table.parquet` -- one row per
+(H3 zone, quarter), with a `peer_group` column already attached by
+`notebooks/09_peer_group_classifier.ipynb`.
+
+Usage:
+    import pandas as pd
+    from src.compute_scores import score_zone_quarters
+
+    zone_quarter = pd.read_parquet("data/processed/zone_quarter_table.parquet")
+    scored = score_zone_quarters(zone_quarter)
+
+See `notebooks/10_scores_and_peer_gap.ipynb` for how the CONFIG values below were chosen and
+validated against the real national distribution, and for the sensitivity testing this file
+doesn't do itself (it's meant to be imported, not run standalone).
 """
-import pandas as pd
 import numpy as np
-
-pd.set_option("display.width", 120)
-pd.set_option("display.max_columns", 20)
+import pandas as pd
 
 # ---------------------------------------------------------------------------
-# 1. CONFIG — the placeholder decisions that need real discussion, not hidden defaults
+# CONFIG -- tunable decisions, calibrated against the real national distribution.
+# Not hidden defaults: each one is a judgment call the brief asks us to justify.
 # ---------------------------------------------------------------------------
 
 # Experience Index weights: w_download + w_upload + w_latency must sum to 1.
-# Starting point below leans on download (matches how the brief frames it — "download dominates
-# the headline") but keeps upload and latency meaningfully in play, per the brief's explicit
-# instruction not to drop upload just because download dominates. THIS IS A DRAFT, NOT A DECISION —
-# the brief requires perturbing these 10-20% and reporting whether the ranking is stable (section 4
-# below does a first pass at that).
+# Draft starting point -- leans on download but keeps upload and latency meaningfully in play.
+# See the notebook's sensitivity test for whether the ranking this produces is stable.
 EXPERIENCE_WEIGHTS = {"download": 0.50, "upload": 0.20, "latency": 0.30}
 
-# Confidence Score weights: how much each evidence signal counts.
+# Confidence Score weights: how much each evidence signal counts toward trustworthiness.
 CONFIDENCE_WEIGHTS = {"tests": 0.50, "devices": 0.30, "quarters": 0.20}
 
-# Below this many tests in a quarter, the brief says the honest output is "insufficient public
-# evidence" — no Experience/Priority classification at all, not just a low score. 5 is a placeholder;
-# the brief notes the median zone nationally sees ~4 tests/quarter, so this threshold is genuinely
-# consequential and worth setting deliberately once real data is in.
+# Below this many tests in a quarter, the honest output is "insufficient public evidence" --
+# no Experience/Priority classification at all, not just a low score. Set just above the real
+# national median (4 tests/zone/quarter, confirmed on this data) so roughly half of all
+# zone-quarters are flagged -- an honest reflection of how sparse this dataset is, not a bug.
 MIN_TESTS_FOR_CLASSIFICATION = 5
 
-# Test-count saturation point for the confidence formula: zones above this many tests/quarter
-# get full marks on the "test volume" component. Placeholder — should be re-checked against the
-# real national test-count distribution once it's known.
-TESTS_SATURATION = 1500
+# Test-count saturation point for the Confidence formula: zones at or above this many
+# tests/quarter get full marks on the test-volume component. Set at the brief's own cited
+# benchmark for a well-measured zone ("top zones exceed 500").
+TESTS_SATURATION = 500
+
+# Total quarters in the dataset window (2024 Q3 -> 2026 Q2). Used to turn "how many of these
+# quarters does this zone have any data in" into a 0-1 fraction for Confidence.
+TOTAL_QUARTERS = 8
 
 
 # ---------------------------------------------------------------------------
-# 2. SYNTHETIC SAMPLE DATA — shaped like the real zone table, standing in until it exists
+# Building blocks
 # ---------------------------------------------------------------------------
 
-sample_zones = pd.DataFrame([
-    {"zone_id": "87e4d2a1", "zone_name": "Al Warsan / International City", "avg_d_kbps": 71000, "avg_u_kbps": 20000, "avg_lat_ms": 32, "tests": 9400, "devices": 1222, "quarters_observed": 8, "population": 96000},
-    {"zone_id": "87e4d2a2", "zone_name": "Mussafah Industrial (ICAD I)",   "avg_d_kbps": 68000, "avg_u_kbps": 18500, "avg_lat_ms": 35, "tests": 2140, "devices": 278,  "quarters_observed": 8, "population": 41000},
-    {"zone_id": "87e4d2a3", "zone_name": "Muwailih Commercial",            "avg_d_kbps": 92000, "avg_u_kbps": 26000, "avg_lat_ms": 27, "tests": 5210, "devices": 677,  "quarters_observed": 8, "population": 63000},
-    {"zone_id": "87e4d2a4", "zone_name": "Al Ain Industrial Area",         "avg_d_kbps": 96000, "avg_u_kbps": 28000, "avg_lat_ms": 41, "tests": 640,  "devices": 83,   "quarters_observed": 5, "population": 22000},
-    {"zone_id": "87e4d2a5", "zone_name": "Al Jurf",                        "avg_d_kbps": 99000, "avg_u_kbps": 29000, "avg_lat_ms": 26, "tests": 305,  "devices": 40,   "quarters_observed": 4, "population": 38000},
-    {"zone_id": "87e4d2a6", "zone_name": "Dubai Core · Sector DXB-04",     "avg_d_kbps": 210000,"avg_u_kbps": 58000, "avg_lat_ms": 18, "tests": 18400,"devices": 2390, "quarters_observed": 8, "population": 120000},
-    {"zone_id": "87e4d2a7", "zone_name": "Ruwais · Sector AUH-11",         "avg_d_kbps": 150000,"avg_u_kbps": 41000, "avg_lat_ms": 22, "tests": 812,  "devices": 105,  "quarters_observed": 6, "population": 15000},
-    {"zone_id": "87e4d2a8", "zone_name": "Kalba · Sector SHJ-03",          "avg_d_kbps": 146000,"avg_u_kbps": 39000, "avg_lat_ms": 24, "tests": 3,    "devices": 1,    "quarters_observed": 2, "population": 9000},
-])
+def normalize_minmax(series: pd.Series, low_pct: float = 1, high_pct: float = 99) -> pd.Series:
+    """Rescale a column onto 0-1, same method every run (reproducibility).
 
-
-# ---------------------------------------------------------------------------
-# 3. THE TWO FORMULAS
-# ---------------------------------------------------------------------------
-
-def normalize_minmax(series: pd.Series) -> pd.Series:
-    """Rescale a column onto 0-1 using the observed min/max in this run. Same method every
-    time, per the brief's requirement that the Experience Index be fully reproducible."""
-    lo, hi = series.min(), series.max()
+    Clips to the 1st/99th percentile *before* rescaling: on the real data, a handful of
+    zone-quarters with only 1-2 tests produce fluke extreme values (e.g. download_mbps has a
+    national median of ~336 but a max of ~2,337). Without clipping, those few outliers would
+    single-handedly compress every other zone's score into a narrow band near zero.
+    """
+    lo, hi = series.quantile(low_pct / 100), series.quantile(high_pct / 100)
     if hi == lo:
         return pd.Series(0.5, index=series.index)
     return ((series - lo) / (hi - lo)).clip(0, 1)
 
 
+def add_effective_latency(df: pd.DataFrame) -> pd.DataFrame:
+    """Loaded latency (`latency_loaded_ms`) where populated -- the brief's preferred metric,
+    since it reflects latency under real network load -- falling back to unloaded latency
+    (`latency_ms`, always populated) for the ~1% of zone-quarters missing it."""
+    df = df.copy()
+    df["latency_effective_ms"] = df["latency_loaded_ms"].fillna(df["latency_ms"])
+    return df
+
+
+def add_quarters_observed(df: pd.DataFrame, total_quarters: int = TOTAL_QUARTERS) -> pd.DataFrame:
+    """How many of the dataset's quarters each zone has any measurement in -- the temporal-
+    coverage signal Confidence needs. Same value repeated on every quarter-row of a given zone,
+    since it describes the zone's overall track record, not just the current quarter."""
+    df = df.copy()
+    df["quarters_observed"] = df.groupby("h3_cell")["quarter"].transform("nunique")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# The two deterministic scores
+# ---------------------------------------------------------------------------
+
 def experience_index(df: pd.DataFrame, weights: dict = EXPERIENCE_WEIGHTS) -> pd.Series:
-    """Experience = w_d*D + w_u*U + w_l*L, each normalized 0-1, rescaled to 0-100.
-    Latency is inverted first (lower ms = better) so higher always means better, for all three."""
+    """Experience = w_d*D + w_u*U + w_l*L, each normalized 0-1 then combined, rescaled to 0-100.
+    Latency is inverted first (lower ms = better) so higher always means better, for all three.
+    Requires `add_effective_latency` to have already been run."""
     assert abs(sum(weights.values()) - 1.0) < 1e-6, "weights must sum to 1"
-    d = normalize_minmax(df["avg_d_kbps"])
-    u = normalize_minmax(df["avg_u_kbps"])
-    l = normalize_minmax(-df["avg_lat_ms"])
+    d = normalize_minmax(df["download_mbps"])
+    u = normalize_minmax(df["upload_mbps"])
+    l = normalize_minmax(-df["latency_effective_ms"])
     return (100 * (weights["download"] * d + weights["upload"] * u + weights["latency"] * l)).round(1)
 
 
 def confidence_score(df: pd.DataFrame, weights: dict = CONFIDENCE_WEIGHTS,
                       min_tests: int = MIN_TESTS_FOR_CLASSIFICATION,
-                      tests_cap: int = TESTS_SATURATION):
-    """Confidence = f(tests, devices, quarters observed). Returns (score 0-100, insufficient flag).
-    'insufficient' zones get no Experience/Priority classification at all — this is a status,
-    not just a low number, per the brief's Case A / Case B example."""
+                      tests_cap: int = TESTS_SATURATION,
+                      total_quarters: int = TOTAL_QUARTERS):
+    """Confidence = f(tests, devices, quarters observed). Returns (score 0-100, insufficient
+    flag). 'Insufficient' zones get no Experience/Priority classification at all -- a status,
+    not just a low number, per the brief's Case A / Case B example: 500 tests/300 devices/8-of-8
+    quarters = trust it; 2 tests/1 device = insufficient evidence, full stop.
+    Requires `add_quarters_observed` to have already been run."""
+    # Log scale: a handful of zones have thousands of tests while the median has ~4 -- a linear
+    # scale would let the busiest zones swamp the comparison.
     tests_component = np.clip(np.log1p(df["tests"]) / np.log1p(tests_cap), 0, 1)
-    # devices/tests close to 1 = mostly distinct testers (good); close to 0 = a few phones
-    # doing most of the testing (risk of single-user skew) — directly the brief's "500 tests
-    # from 3 phones is not the same as 500 tests from 300 phones" example.
+    # devices/tests near 1 = mostly distinct testers (good); near 0 = a few phones testing
+    # repeatedly (risk of single-user skew) -- the brief's own "500 tests from 3 phones is not
+    # the same as 500 tests from 300 phones" example.
     device_ratio = (df["devices"] / df["tests"]).clip(0, 1)
-    quarters_component = (df["quarters_observed"] / 8).clip(0, 1)
+    quarters_component = (df["quarters_observed"] / total_quarters).clip(0, 1)
 
     raw = 100 * (weights["tests"] * tests_component + weights["devices"] * device_ratio
                  + weights["quarters"] * quarters_component)
@@ -110,57 +128,42 @@ def confidence_score(df: pd.DataFrame, weights: dict = CONFIDENCE_WEIGHTS,
 
 
 # ---------------------------------------------------------------------------
-# 4. RUN IT
+# Peer Gap -- how a zone compares to its own peer group, this quarter
 # ---------------------------------------------------------------------------
 
-df = sample_zones.copy()
-df["experience_index"] = experience_index(df)
-df["confidence_score"], df["insufficient_evidence"] = confidence_score(df)
+def peer_gap(df: pd.DataFrame) -> pd.DataFrame:
+    """Adds `peer_group_median_experience`, `peer_gap` and `peer_gap_pct`: how far each zone's
+    Experience Index sits from its peer group's median *in that same quarter*. Requires
+    `experience_index`, `insufficient_evidence` and `peer_group` to already be on `df`.
 
-# Per the brief's fixed rule: insufficient-evidence zones get no classification at all.
-df.loc[df["insufficient_evidence"], "experience_index"] = np.nan
+    The peer-group median itself is computed from confidently-scored zones only -- an
+    insufficient-evidence zone (Experience Index = NaN) can't be allowed to drag down the
+    benchmark that other zones in its group get compared against."""
+    df = df.copy()
+    trustworthy = df.loc[~df["insufficient_evidence"]]
+    peer_median = (
+        trustworthy.groupby(["peer_group", "quarter"])["experience_index"]
+        .median()
+        .rename("peer_group_median_experience")
+    )
+    df = df.merge(peer_median, on=["peer_group", "quarter"], how="left")
+    df["peer_gap"] = (df["experience_index"] - df["peer_group_median_experience"]).round(1)
+    df["peer_gap_pct"] = (100 * df["peer_gap"] / df["peer_group_median_experience"]).round(1)
+    return df
 
-print("=" * 100)
-print("EXPERIENCE INDEX + CONFIDENCE SCORE — sample output")
-print("=" * 100)
-print(df[["zone_name", "avg_d_kbps", "avg_u_kbps", "avg_lat_ms", "tests", "devices",
-          "quarters_observed", "experience_index", "confidence_score", "insufficient_evidence"]]
-      .to_string(index=False))
-
-# ---------------------------------------------------------------------------
-# 5. SENSITIVITY PREVIEW — a first pass at the brief's required weight-perturbation test
-# ---------------------------------------------------------------------------
-print()
-print("=" * 100)
-print("SENSITIVITY PREVIEW — perturbing Experience weights +/-15%, does the ranking hold?")
-print("=" * 100)
-
-base_rank = df.dropna(subset=["experience_index"]).sort_values("experience_index").zone_name.tolist()
-
-perturbations = {
-    "download +15% (rest rescaled)": {"download": 0.575, "upload": 0.17, "latency": 0.255},
-    "download -15% (rest rescaled)": {"download": 0.425, "upload": 0.23, "latency": 0.345},
-    "latency +15% (rest rescaled)":  {"download": 0.4625, "upload": 0.1875, "latency": 0.35},
-}
-
-for label, w in perturbations.items():
-    df_p = sample_zones.copy()
-    df_p["experience_index"] = experience_index(df_p, weights=w)
-    df_p["confidence_score"], df_p["insufficient_evidence"] = confidence_score(df_p)
-    df_p.loc[df_p["insufficient_evidence"], "experience_index"] = np.nan
-    rank_p = df_p.dropna(subset=["experience_index"]).sort_values("experience_index").zone_name.tolist()
-    changed = rank_p != base_rank
-    print(f"- {label}: ranking {'CHANGED' if changed else 'held steady'}")
-
-print()
-print("This is a first pass on 8 sample zones, not the formal T5 sensitivity test (that needs")
-print("the real national dataset). But the mechanism — reweight, recompute, compare rankings —")
-print("is exactly what the real test will run.")
 
 # ---------------------------------------------------------------------------
-# 6. SWAPPING IN REAL DATA — the only change needed once Data/GIS delivers the zone table
+# Full pipeline
 # ---------------------------------------------------------------------------
-# df = pd.read_parquet("data/processed/zone_quarter_table.parquet")   # <- replace sample_zones with this
-# df["experience_index"] = experience_index(df)
-# df["confidence_score"], df["insufficient_evidence"] = confidence_score(df)
-# df.loc[df["insufficient_evidence"], "experience_index"] = np.nan
+
+def score_zone_quarters(df: pd.DataFrame) -> pd.DataFrame:
+    """Runs every step in order: effective latency -> quarters observed -> Experience Index ->
+    Confidence Score -> insufficient-evidence rule -> Peer Gap. Returns a new DataFrame; the
+    input `df` is never modified in place."""
+    df = add_effective_latency(df)
+    df = add_quarters_observed(df)
+    df["experience_index"] = experience_index(df)
+    df["confidence_score"], df["insufficient_evidence"] = confidence_score(df)
+    df.loc[df["insufficient_evidence"], "experience_index"] = np.nan
+    df = peer_gap(df)
+    return df
