@@ -37,10 +37,19 @@ EXPERIENCE_WEIGHTS = {"download": 0.50, "upload": 0.20, "latency": 0.30}
 CONFIDENCE_WEIGHTS = {"tests": 0.50, "devices": 0.30, "quarters": 0.20}
 
 # Below this many tests in a quarter, the honest output is "insufficient public evidence" --
-# no Experience/Priority classification at all, not just a low score. Set just above the real
-# national median (4 tests/zone/quarter, confirmed on this data) so roughly half of all
-# zone-quarters are flagged -- an honest reflection of how sparse this dataset is, not a bug.
-MIN_TESTS_FOR_CLASSIFICATION = 5
+# no Experience/Priority classification at all, not just a low score. This is the ONE
+# authoritative eligibility gate for the whole project: every downstream module (Peer Gap,
+# trends, anomaly detection, priority, the dashboard, the copilot) reads the `insufficient_
+# evidence` flag this constant produces rather than re-deriving its own threshold -- change
+# it here and it propagates everywhere automatically. Set to 30 to match
+# notebooks/04_h3_resolution_choice.ipynb and notebooks/06_first_uae_map.ipynb's own evidence
+# bar (both independently chose 30 as "sufficiently sampled"), not the earlier placeholder of
+# 5 (which flagged only ~half of zone-quarters as insufficient and let the median-adjacent
+# tail of very thinly-tested zones get a full classification anyway). Confidence Score is a
+# separate concept from this gate -- it still differentiates strength of evidence *among*
+# zones that clear this bar (a 30-test zone scores lower confidence than a 500-test zone),
+# it just no longer decides whether a zone is classified at all.
+MIN_TESTS_FOR_RELIABLE_EVIDENCE = 30
 
 # Test-count saturation point for the Confidence formula: zones at or above this many
 # tests/quarter get full marks on the test-volume component. Set at the brief's own cited
@@ -104,7 +113,7 @@ def experience_index(df: pd.DataFrame, weights: dict = EXPERIENCE_WEIGHTS) -> pd
 
 
 def confidence_score(df: pd.DataFrame, weights: dict = CONFIDENCE_WEIGHTS,
-                      min_tests: int = MIN_TESTS_FOR_CLASSIFICATION,
+                      min_tests: int = MIN_TESTS_FOR_RELIABLE_EVIDENCE,
                       tests_cap: int = TESTS_SATURATION,
                       total_quarters: int = TOTAL_QUARTERS):
     """Confidence = f(tests, devices, quarters observed). Returns (score 0-100, insufficient

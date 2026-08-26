@@ -53,6 +53,12 @@ def add_priority(df: pd.DataFrame, weights: dict = PRIORITY_WEIGHTS) -> pd.DataF
     classified["factor_ml_anomaly"] = classified.groupby("quarter")["ml_anomaly_raw"].transform(
         lambda s: 100 * normalize_minmax(s)
     )
+    # A handful of classified zones land alone in their (peer_group, quarter) cell (group size
+    # 1 -> z-score std is undefined), so neither Isolation Forest can score them at all -- both
+    # ml scores are NaN, not just one. Missing ML evidence means "no anomaly signal available,"
+    # not "this zone can't have a Priority Score" -- default to 0 (least anomalous) rather than
+    # letting a NaN factor null out the other three, otherwise-valid, deterministic factors.
+    classified["factor_ml_anomaly"] = classified["factor_ml_anomaly"].fillna(0)
     classified["factor_deterioration"] = classified["deteriorating"].astype(float) * 100
     classified["factor_population"] = classified.groupby("quarter")["population"].transform(
         lambda s: 100 * normalize_minmax(s)

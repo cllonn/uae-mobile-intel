@@ -16,6 +16,10 @@ scikit-learn==1.7.2
 # Mapping
 folium==0.20.0
 
+# GenAI (optional -- only needed to connect a real LLM to src/copilot.py; without it, the
+# copilot runs in deterministic template-narration mode with zero external calls)
+# anthropic==0.69.0
+
 # Notebook execution (VS Code / Jupyter)
 ipykernel==7.3.0
 nbformat==5.11.0

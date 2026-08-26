@@ -1,11 +1,24 @@
-# UAE Mobile Network Experience Intelligence 
+# UAE Mobile Network Experience Intelligence
 
+An AI-powered geographic intelligence platform for analyzing publicly measured mobile network
+experience across the UAE, built from public Ookla Speedtest, WorldPop, and OpenStreetMap data.
+**This is not e& network data** — the public dataset carries no operator attribution, and the
+system says so explicitly wherever it's relevant.
 
-## Project Overview
+## Status
 
-This project aims to develop an AI-powered geographic intelligence
-platform for analyzing publicly measured mobile network experience
-across the UAE.
+- **Phase 1 — Foundation: Complete.** Data acquisition, UAE boundary clipping, H3 resolution
+  choice, real emirate field.
+- **Phase 2 — Scores: Complete.** Experience Index, Confidence Score, peer groups, Peer Gap.
+- **Phase 3 — Intelligence: Complete, validated through T0–T5.** Trend/deterioration, ML
+  anomaly detection with an honest baseline comparison, Priority Engine.
+- **Phase 4 — Dashboard: Working real-data prototype.** All 8 quarters, all 7 emirates, 4
+  layers, drill-down — every number traced to `zone_priority.parquet` (T1).
+- **GenAI / Grounded Copilot: Next phase, pending mentor confirmation.** `src/copilot_tools.py`
+  and `src/copilot.py` exist as **preparatory/prototype routing code** — a deterministic tool
+  layer and a keyword-based question router with a template-only narrator (no LLM connected
+  yet). This is scaffolding for the next phase, not a completed GenAI system; see "Grounded
+  copilot (prototype)" below for exactly what does and doesn't exist yet.
 
 ## Setup
 
@@ -13,180 +26,172 @@ across the UAE.
 pip install -r requirements.txt
 ```
 
-Tested with Python 3.13. Then open any notebook in `notebooks/` (VS Code's Jupyter extension or
-JupyterLab both work) and run all cells top to bottom — each collection notebook downloads its own
-raw data on first run, so no manual download step is needed.
+Tested with Python 3.13. Open any notebook in `notebooks/` (VS Code's Jupyter extension or
+JupyterLab both work) and run all cells top to bottom — each collection notebook downloads its
+own raw data on first run, so no manual download step is needed.
 
-## Data Sources
+## Data sources
 
-| Dataset | Status | Notebook | Notes |
-|---|---|---|---|
-| Ookla Speedtest Open Data (mobile) | Acquired, UAE-clipped, aggregated to H3 zones | [`01_ookla_collection.ipynb`](notebooks/01_ookla_collection.ipynb) → [`05_zone_aggregation.ipynb`](notebooks/05_zone_aggregation.ipynb) | 8 quarters, 2024 Q3 → 2026 Q2. CC BY-NC-SA 4.0 (non-commercial). |
-| WorldPop UAE population | Acquired, validated, aggregated to H3 zones | [`02_worldpop_collection.ipynb`](notebooks/02_worldpop_collection.ipynb) → [`05_zone_aggregation.ipynb`](notebooks/05_zone_aggregation.ipynb) | R2025A constrained, 2026, 100m. National total 11,476,873 matches brief; conserved exactly through H3 aggregation. CC BY 4.0. |
-| OpenStreetMap | Acquired, UAE-clipped, aggregated to H3 zones | [`03_osm_collection.ipynb`](notebooks/03_osm_collection.ipynb) → [`07_osm_feature_extraction.ipynb`](notebooks/07_osm_feature_extraction.ipynb) | Geofabrik GCC States PBF, buildings/roads/POIs extracted with pyosmium, land-use checked but not used as a classifier (too thin — see notebook). ODbL. |
+| Dataset | Notebook | Notes |
+|---|---|---|
+| Ookla Speedtest Open Data (mobile) | [`01_ookla_collection.ipynb`](notebooks/01_ookla_collection.ipynb) → [`05_zone_aggregation.ipynb`](notebooks/05_zone_aggregation.ipynb) | 8 quarters, 2024 Q3 → 2026 Q2. CC BY-NC-SA 4.0 (non-commercial). |
+| WorldPop UAE population | [`02_worldpop_collection.ipynb`](notebooks/02_worldpop_collection.ipynb) → [`05_zone_aggregation.ipynb`](notebooks/05_zone_aggregation.ipynb) | R2025A constrained, 2026, 100m. National total 11,476,873, conserved exactly through H3 aggregation. CC BY 4.0. |
+| OpenStreetMap | [`03_osm_collection.ipynb`](notebooks/03_osm_collection.ipynb) → [`07_osm_feature_extraction.ipynb`](notebooks/07_osm_feature_extraction.ipynb) | Geofabrik GCC States PBF: buildings/roads/POIs for peer grouping, and the 7 emirate administrative boundaries. ODbL. |
 
-All three are joined into one analysis-ready table by
-[`08_zone_quarter_table.ipynb`](notebooks/08_zone_quarter_table.ipynb) →
-`data/processed/zone_quarter_table.parquet` (one row per `(H3 cell, quarter)`, 13,597 rows), then
-[`09_peer_group_classifier.ipynb`](notebooks/09_peer_group_classifier.ipynb) adds a `peer_group`
-column to that same table (see below).
+Full field-by-field detail is in [`docs/data_dictionary.md`](docs/data_dictionary.md).
 
-Raw files live under `data/raw/<dataset>/` and are **gitignored on purpose**: the 8 Ookla quarters
-alone total ~1.5GB with individual files over GitHub's 100MB push limit, so they can't be committed
-at all, and the OSM extract (~250MB) isn't far behind. Every collection notebook downloads its own
-raw inputs (including the UAE boundary polygon) if they're not already present locally, so running
-a notebook end to end reproduces `data/raw/` from nothing — you never need to source these files any
-other way. Processed, UAE-clipped outputs (small) live under `data/processed/` and **are** committed,
-so you don't have to re-run the raw collection notebooks just to get a working dataset.
+Raw files live under `data/raw/<dataset>/` and are **gitignored on purpose** (the 8 Ookla
+quarters alone total ~1.5GB, over GitHub's push limit). Every collection notebook downloads its
+own raw inputs if they're not already present, so running a notebook end to end reproduces
+`data/raw/` from nothing. Processed outputs (small) live under `data/processed/` and **are**
+committed.
 
 **Geographic unit:** H3 resolution 7, chosen empirically in
-[`04_h3_resolution_choice.ipynb`](notebooks/04_h3_resolution_choice.ipynb) — it reproduces the
-brief's own cited density figures (median 4 tests/zone, ~83% of zones below 30 tests) on
-independently rebuilt data, yields ~300 well-measured zones nationally as the brief predicts, and
-has quarter-over-quarter stability close to resolution 6 while resolving far more zones for
-drill-down. The decision (with supporting numbers) is persisted at
-`data/processed/h3_resolution.json` so downstream notebooks can't silently drift out of sync with it.
+[`04_h3_resolution_choice.ipynb`](notebooks/04_h3_resolution_choice.ipynb) against measurement
+density and quarter-over-quarter stability — see that notebook for the resolution 6/7/8
+comparison. Persisted at `data/processed/h3_resolution.json`.
 
-## Code Layout
+## Pipeline architecture
 
-- `notebooks/` — data collection, validation, and exploration (Ookla, WorldPop, OSM, H3
-  zone aggregation, mapping, peer-group classification). Each collection notebook is
-  self-contained and reproduces its own raw inputs on first run.
-- `src/` — deterministic Python analytics code, not notebooks. Currently
-  [`compute_scores.py`](src/compute_scores.py): pure, side-effect-free functions for the
-  Experience Index, Confidence Score, and Peer Gap. One entry point,
-  `score_zone_quarters(df)`, runs the full pipeline; notebooks and the eventual copilot import
-  from here rather than duplicating the formulas. Kept as plain Python rather than a notebook
-  since it's library code meant to be imported, not read top-to-bottom.
+```
+Ookla + WorldPop + OSM
+          |
+       H3 Zones  ---- + emirate, peer_group (static, joined once)
+          |
+Experience + Confidence   (src/compute_scores.py, deterministic)
+          |
+Peer Gap + Trend + ML anomaly   (src/trends.py, src/anomaly_detection.py)
+          |
+   Priority Engine   (src/priority.py, deterministic + confidence guardrail)
+          |
+ zone_priority.parquet   <- the one file the dashboard and copilot both read
+       /        \
+ Dashboard    src/copilot_tools.py   (10 deterministic query functions, no scoring)
+ (build_          |
+  dashboard.py) src/copilot.py  --  question -> tool routing -> [LLM narrates | template fallback]
+                   |
+            Grounded answer / zone brief
+```
 
-## Current Phase
+- `notebooks/` — data collection, exploration, and one-time classification work (Ookla,
+  WorldPop, OSM, H3 zone aggregation, peer-group classification). Self-contained; each
+  reproduces its own raw inputs on first run.
+- `src/` — deterministic Python analytics + the copilot, meant to be imported, not read
+  top-to-bottom as a notebook.
+- `scripts/` — one-off/reusable utilities (emirate boundary extraction, the canonical-questions
+  demo).
+- `tests/` — reproducible validation scripts (T1/T3/T4/T5).
+- `docs/` — data dictionary, validation summary, T7 usability protocol.
 
-Phase 2 (Scores), building on a cleared Phase 1 gate. Real public UAE mobile measurements render
-on a map, per-zone, in [`06_first_uae_map.ipynb`](notebooks/06_first_uae_map.ipynb) (saved
-standalone at `data/processed/uae_map_2026Q2.html`) — raw metrics only, no scores yet.
+## The evidence threshold (read this first)
 
-Since then: [`08_zone_quarter_table.ipynb`](notebooks/08_zone_quarter_table.ipynb) joins Ookla
-(per-quarter), WorldPop, and OSM density into one master table,
-`data/processed/zone_quarter_table.parquet` (one row per `(H3 cell, quarter)`, 13,597 rows) —
-everything downstream reads from this file instead of re-joining three parquet files each time.
-[`09_peer_group_classifier.ipynb`](notebooks/09_peer_group_classifier.ipynb) then builds the
-brief's mandatory peer-group classifier: KMeans (`k=4`) on log-transformed, standardized
-population density, building-footprint %, POI density and road density (never OSM land-use tag,
-confirmed too thin on this data), with human-readable labels assigned from cluster centroids via
-an explainable rule (density-intensity rank, then POI-to-built ratio for the industrial/
-residential split). All four groups clear a 30-zone minimum and show real within-group spread in
-raw download speed (proxy pending the real Experience Index) — both risks the brief calls out
-explicitly. Result:
+**A zone-quarter needs `tests >= 30` to be classified at all** —
+`MIN_TESTS_FOR_RELIABLE_EVIDENCE = 30` in `src/compute_scores.py`, the single authoritative gate
+every other module reads (`insufficient_evidence`), never re-derives. Below 30 tests, a zone
+gets **no Experience Index, no Priority Score, nothing** — the honest output is "insufficient
+public evidence," never a low score. Confidence Score is a separate concept: it still
+differentiates strength of evidence *among* zones that clear this bar (30 tests scores lower
+confidence than 500 tests) — it doesn't decide whether a zone is classified.
 
-| Peer group | Zones | Pop. density (per km²) | Building footprint % | POI density (per km²) | Road density (km/km²) |
-|---|---|---|---|---|---|
-| commercial/urban-core | 303 | 2,823 | 9.7% | 12.4 | 20.4 |
-| low-density residential | 854 | 860 | 0.7% | 0.6 | 8.8 |
-| industrial | 1,413 | 138 | 0.07% | 0.09 | 2.6 |
-| rural/edge | 830 | 4 | 0.01% | 0.03 | 0.6 |
+2026Q2 headline numbers under this rule: 1,815 zones measured, **314 classified (17.3%)**,
+37.6% of national population represented, 32 zones flagged for investigation. Across all 8
+quarters: 2,085 of 13,597 zone-quarters classified (84.7% insufficient evidence) — the brief's
+own point that a "few hundred well-measured zones, not thousands" is the honest scale of this
+dataset, confirmed directly on this data.
 
-Saved to `data/processed/peer_groups_uae.parquet` (standalone) and merged as a `peer_group`
-column onto `zone_quarter_table.parquet`. One honest caveat for the report: at H3 res-7, the
-"industrial" label is the largest group (41.6% of zones) and reads more like "sparse/light
-development" than strictly industrial land — a proxy from density signature, not a direct
-land-use tag (which the brief already ruled out as too thin). Worth restating in the limitations
-section, not hidden.
+## Deterministic scores
 
-[`10_scores_and_peer_gap.ipynb`](notebooks/10_scores_and_peer_gap.ipynb) then runs the real
-Experience Index, Confidence Score, and Peer Gap for the first time — output at
-`data/processed/zone_scores.parquet` (13,597 rows, all `zone_quarter_table` columns plus
-`experience_index`, `confidence_score`, `insufficient_evidence`, `peer_gap`,
-`peer_gap_pct`). Headline numbers:
+**Experience Index** (`src/compute_scores.py`) — 0–100: 50% download + 20% upload + 30% inverse
+latency, each min-max normalized. **Confidence Score** — 0–100: 50% log-scaled test volume +
+30% devices/tests ratio + 20% quarters-observed fraction. **Peer Gap** — a zone's Experience
+Index minus its peer group's median, in the *same quarter*, computed from classified zones only.
+Peer groups (`09_peer_group_classifier.ipynb`, KMeans k=4 on density features, never OSM
+land-use tag): commercial/urban-core, low-density residential, industrial, rural/edge. 2026Q2
+peer medians: commercial/urban-core 43.9, low-density residential 43.4, industrial 30.4,
+rural/edge 17.7 — real, meaningful spread.
 
-- **54.0% of zone-quarters nationally are flagged insufficient evidence** (below 5 tests/quarter)
-  and get no Experience Index at all — matches the brief's own cited median of ~4 tests/zone
-  exactly. Latest quarter (2026Q2) alone: 1,815 zones measured, 868 classified.
-- **Confidence correctly separates real cases**: a real zone-quarter with 5,064 tests/156 devices
-  across all 8 quarters scores 70.9 confidence; a real 1-test/1-device zone scores 43.1 and gets
-  `NaN` Experience Index — "insufficient public evidence," not a bad score.
-- **Weight sensitivity (T5 preview, on 868 real classified zones, not 8 synthetic ones)**:
-  perturbing Experience weights ±15% barely moves the ranking — Spearman ρ = 0.998–0.999,
-  top-20 overlap 19–20 out of 20 across all three perturbations tested. The current 50/20/30
-  split is not fragile on this data.
-- **Peer Gap is live**: peer-group medians differ meaningfully (39.0 industrial vs. 44.2
-  commercial/urban-core, 2026Q2), so the ten worst-gap zones per quarter can now be listed
-  directly — the first of the brief's ten canonical questions this system can answer end to end.
+## Trend, ML anomaly detection, and Priority
 
-## Phase 3 (Intelligence) — trend, ML anomaly detection, priority
+- **Trend** (`src/trends.py`) — deterioration relative to peer-group trend (tracks `peer_gap`
+  quarter to quarter, never raw Mbps), flagged only after 3 consecutive declining quarters. 39
+  unique zones hit this pattern at some point across the 8-quarter window; 10 are currently
+  deteriorating as of 2026Q2.
+- **ML anomaly detection** (`src/anomaly_detection.py`) — two Isolation Forest models (Peer Gap:
+  vs. peer-group z-scores this quarter; Temporal Anomaly: vs. the zone's own history), each
+  compared against a deterministic bottom-decile-download baseline. **T2 result, reported
+  honestly**: on a blind synthetic-anomaly hold-out (`tests/test_t2_anomaly_benchmark.py`,
+  reproducible), the simple baseline outperformed both ML detectors on every metric
+  (precision/recall/F1/FPR) — see `docs/validation_summary.md` for the full numbers, including
+  a per-fault-type breakdown showing the ML almost never catches a pure download-only fault.
+  Kept as supplementary evidence, not presented as superior.
+- **Priority** (`src/priority.py`) — `Priority = 0.35·PeerGap + 0.20·MLAnomaly +
+  0.20·Deterioration + 0.25·Population`, **multiplied** by `confidence/100` (not added as a
+  fifth factor), so a low-confidence zone structurally cannot reach a high Priority Score. Top
+  10% per quarter flagged — 32 of 314 in 2026Q2. Sensitivity-tested (T5): ±15% weight
+  perturbation, worst-case Spearman ρ=0.996 — not fragile.
+- `src/run_pipeline.py` chains all of the above into `data/processed/zone_priority.parquet`.
+  Re-run whenever an upstream input changes: `python -m src.run_pipeline`.
 
-Built directly as `src/*.py` (no exploratory notebook for these three — same reusable-logic
-pattern as `compute_scores.py`, just skipping the narrated write-up for now to get to the
-product UI faster):
+## Emirate field
 
-- [`src/trends.py`](src/trends.py) — deterioration relative to peer-group trend (tracks how
-  `peer_gap` moves quarter to quarter, not raw Mbps), flagged only after **3 consecutive**
-  declining quarters. Tried at 2 first (the brief's lower bound): that flagged 413 zones
-  nationally at some point across the window, which is sampling noise on data this sparse, not
-  genuine deterioration (the brief's own comparable figures are 71–99 zones). 3 consecutive
-  declines brings that to 107 — much closer to the brief's cited scale, and still within its
-  "two or three quarters" allowance.
-- [`src/anomaly_detection.py`](src/anomaly_detection.py) — the mandatory ML capability: two
-  Isolation Forest models (Peer Gap: vs. peer-group z-scores this quarter; Temporal Anomaly: vs.
-  the zone's own history), each compared against a deterministic bottom-decile-download
-  baseline. Real, honest divergence: Peer Gap ML flags 313 zone-quarters vs. the baseline's 381,
-  with only 65 in common — the ML is finding something different from the simple rule, not just
-  rediscovering it. **This is a first-pass detector, not the formal T2 benchmark** (synthetic
-  anomaly injection with precision/recall/F1 on a blind hold-out set) — that's still open, see
-  below.
-- [`src/priority.py`](src/priority.py) — `Priority = 0.35·PeerGap + 0.20·MLAnomaly +
-  0.20·Deterioration + 0.25·Population`, then **multiplied** by `confidence/100` — not added as
-  a fifth factor — so the brief's fixed rule (low confidence can never auto-become high
-  priority) is structural, not a judgment call that could leak through. Top 10% per quarter
-  flagged as priority zones (89 of 868 in the latest quarter). Weights are a first pass, not yet
-  sensitivity-tested (T5) — see below.
-- [`src/run_pipeline.py`](src/run_pipeline.py) — chains all of the above (`compute_scores` →
-  `trends` → `anomaly_detection` → `priority`) into one script,
-  `data/processed/zone_priority.parquet`. Re-run this whenever an upstream input changes.
+`scripts/build_emirate_field.py` extracts the 7 emirates' real administrative boundaries
+(`admin_level=4`, matched by OSM `ISO3166-2` tag) from the GCC PBF already in the repo, and
+assigns every H3 zone to one emirate via centroid-in-polygon join. One `emirate` column, added
+once to `zone_quarter_table.parquet`, flows through `run_pipeline.py` into
+`zone_priority.parquet` — the dashboard, T0 reporting, and the copilot all read the same field,
+never separate logic. Re-run with `python -m scripts.build_emirate_field` if the boundary or
+zone set ever changes (caches the extracted boundary GeoJSON; only re-extracts from the 252MB
+PBF if that cache is deleted).
 
-## Phase 4 (Product) — the interactive map, minus the copilot
+## Dashboard
 
-[`src/build_dashboard.py`](src/build_dashboard.py) generates capability #1 (Interactive UAE
-experience map: Experience/Priority/Trend/Confidence layers, national view, zone drill-down) as
-one self-contained HTML file — `data/processed/uae_dashboard.html` — matching the brief's design
-mockup, minus the copilot chat (a separate capability, not built yet). Plain SVG + vanilla JS,
-no external libraries or CDN dependency: every hexagon's geometry is precomputed in Python (real
-H3 boundaries, a simple equirectangular projection) and written straight into the page, so the
-browser only recolors paths on click — no client-side geometry math, and it works fully offline.
-15,695 background hexagons at H3 res 7 (matching every other notebook — resolution 8 covering
-the whole country was the ~110,000-hexagon, 50MB-file mistake `06_first_uae_map.ipynb` originally
-made). Clicking an unclassified (grey) hexagon correctly shows "insufficient public evidence,"
-never a fabricated score. Verified with a headless-browser screenshot pass (all four layers, zone
-drill-down, and the insufficient-evidence state) — no console errors, `src/run_pipeline.py` →
-`src/build_dashboard.py` reproduces cleanly end to end.
+`src/build_dashboard.py` generates the interactive UAE map as one self-contained HTML file —
+`data/processed/uae_dashboard.html` — plain SVG + vanilla JS, no external libraries, works
+offline. All 8 quarters and all 7 emirates are browsable via dropdowns; switching either
+re-filters the map, the top-priority list, and the KPI strip live. Four switchable layers
+(Experience / Priority / Trend / Confidence). Clicking an unclassified (grey) hexagon shows
+"insufficient public evidence," never a fabricated score.
 
-Run: `python -m src.run_pipeline && python -m src.build_dashboard` from the repo root.
+Run: `python -m src.build_dashboard` (after `run_pipeline.py`).
 
-**Known limitations, stated plainly rather than hidden:**
-- No real place names — OSM place/locality data isn't joined in yet, so zones show as
-  `H3 <id>` plus a "nearest emirate" approximation (nearest-nominal-center distance, not a real
-  boundary lookup). Inventing names like the mockup's "Al Warsan / International City" would
-  violate the brief's "never invented" rule, so this is left honest rather than pretty.
-- Only the latest quarter (2026Q2) is interactive; the quarter dropdown is a label, not a
-  working selector — full time-travel across all 8 quarters is future work.
-- The ML anomaly detector, trend threshold, and priority weights are working first passes, not
-  yet formally validated (see Next Steps).
+**Known limitations, stated plainly:**
+- No invented place names — zones show as `H3 <id>` plus the real `emirate` field.
+- Priority Score is a national ranking; filtering to one emirate shows which nationally-ranked
+  zones fall there, not a separate local re-ranking.
+- The ML anomaly detector currently underperforms the deterministic baseline (T2, reported
+  honestly, not hidden).
 
-## Next Steps
+## Grounded copilot (prototype — pending mentor confirmation before Phase 5 is called "done")
 
-1. **Data dictionary** — document every field, transformation and source across all datasets.
-2. **T0 coverage/representativeness audit** — scored vs. eligible zones by emirate, share of
-   population in sufficiently-sampled cells, measurement availability across urban/suburban/rural.
-3. **Formal T2 synthetic anomaly benchmark** — inject known anomalies (download −40%, latency
-   +80%, gradual 3-quarter deterioration, combined), precision/recall/F1/FPR on a blind hold-out
-   set, for both ML detectors against the baseline.
-4. **T5 priority sensitivity test** — perturb the 0.35/0.20/0.20/0.25 weights ±10–20%, report
-   whether the top-ranked zones reshuffle.
-5. **Grounded copilot + AI zone briefs** — capability #7, the one piece of the dashboard
-   deliberately left out so far.
-6. **Testing & evaluation pack** — T0–T7 formally run and reported, business case, architecture
-   diagram, limitations statement, presentation.
+Preparatory work for the GenAI phase, not a finished GenAI system: no LLM is connected yet.
+`src/copilot_tools.py` — 10 deterministic functions (`get_top_priority_zones`,
+`get_zone_trend`, `get_coverage_summary`, etc.) that read only `zone_priority.parquet` and
+return plain dicts. No score is ever calculated in this layer. `src/copilot.py` routes a
+question to one of these functions by keyword matching (not an LLM), then narrates the result —
+today that narration is a deterministic string template only; wiring in a real LLM (via
+`ANTHROPIC_API_KEY`, `pip install anthropic`) is the next-phase work, not yet done. A
+keyword-based guardrail (`copilot.check_refusal`) intercepts operator-attribution questions
+("which e& site...") **before** any tool is chosen. `copilot.generate_zone_brief(zone_id)`
+assembles the same evidence a real AI zone brief would need; every number in it traces back to
+`copilot_tools.get_zone_details`.
 
-**Note:** `src/experience_confidence_scores.py` (an earlier synthetic-data draft of the
-Experience/Confidence formulas) is now superseded by `src/compute_scores.py` and can likely be
-removed — left in place for now since it was Saif's contribution, worth a quick team check
-before deleting.
+Run all 14 test questions end-to-end (tool selected, tool output, final template answer):
+`python -m scripts.demo_canonical_questions`
+
+## Testing & validation
+
+`tests/` holds reproducible T1/T2/T3/T4/T5 scripts — all passing on the current
+(30-test-threshold) pipeline output, including the honest T2 ML-vs-baseline result.
+`docs/validation_summary.md` has the full T0–T7 status and how to run them.
+`docs/t7_usability_protocol.md` is a real, un-run live-tester protocol, ready to execute.
+`docs/data_dictionary.md` documents every field across every processed table.
+`docs/mentor_methodology_summary.md` is a short, plain-language walkthrough for the mentor demo.
+
+## Next steps
+
+1. Run the T7 live usability protocol with a real outside tester (`docs/t7_usability_protocol.md`).
+2. Get mentor sign-off on the analytical methodology (Section "Status" above) before starting
+   GenAI in earnest.
+3. Connect a real LLM (`ANTHROPIC_API_KEY` + `pip install anthropic`) and score the T6
+   51-question copilot bank.
+4. Business case, architecture diagram for future internal-data integration, final presentation.

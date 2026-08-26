@@ -6,16 +6,15 @@ capability #7, a separate piece); this is the map + evidence panel it sits insid
 
 Design: plain SVG + vanilla JS, no external libraries. Every hexagon's shape is precomputed in
 Python (real H3 geometry, real equirectangular-ish projection -- see `_project`) and written
-straight into the page as an SVG path; the browser only has to recolor paths on layer/zone
-clicks, not compute any geometry. That keeps the file self-contained (works offline, no CDN
-dependency) and light: ~15,700 background hexagons (the full country at H3 res 7 -- the same
-resolution used everywhere else in this pipeline) instead of the ~110,000 that resolution 8
-produced in `06_first_uae_map.ipynb` and made the file too heavy to load.
+straight into the page as an SVG path; the browser only has to recolor paths on layer/zone/
+quarter/emirate changes, not compute any geometry. That keeps the file self-contained (works
+offline, no CDN dependency).
 
 Run: `python -m src.build_dashboard` from the repo root. Reads `zone_priority.parquet` (the
-output of the scores -> trend -> anomaly -> priority pipeline) and `population_zones_uae.parquet`
-(for the population-represented KPI, which needs the *full* population universe, not just
-measured zones, as its denominator). Writes `data/processed/uae_dashboard.html`.
+output of the scores -> trend -> anomaly -> priority pipeline, now carrying the `emirate` field
+added by `scripts/build_emirate_field.py`) and `population_zones_uae.parquet` (for the
+population-represented KPI, which needs the *full* population universe, not just measured
+zones, as its denominator). Writes `data/processed/uae_dashboard.html`.
 """
 import json
 import math
@@ -23,22 +22,24 @@ from pathlib import Path
 
 import geopandas as gpd
 import h3
-import numpy as np
 import pandas as pd
 
 MAP_H3_RESOLUTION = 7  # matches every other notebook in the pipeline
-LATEST_QUARTER = "2026Q2"
+QUARTER_ORDER = ["2024Q3", "2024Q4", "2025Q1", "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2"]
 MAP_WIDTH = 900
 
-# Approximate label points -- for on-map city/emirate labels and the "which emirate is this
-# zone nearest to" approximation shown in the zone panel. Nearest-center only, not a real
-# administrative boundary lookup -- flagged as approximate everywhere it's shown, never
-# presented as an authoritative emirate assignment.
+# Purely cosmetic map-text pins (city names for visual orientation) -- unrelated to the real
+# `emirate` field used for filtering/attribution. Kept separate on purpose: a zone's emirate
+# comes from the authoritative boundary join (scripts/build_emirate_field.py), never from
+# "nearest of these 9 dots," which is what this dashboard used before that field existed.
 PLACE_LABELS = {
     "ABU DHABI": (24.4667, 54.3667), "DUBAI": (25.2048, 55.2708), "SHARJAH": (25.3573, 55.4033),
     "AJMAN": (25.4111, 55.4354), "RAK": (25.7895, 55.9432), "FUJAIRAH": (25.1288, 56.3265),
     "AL AIN": (24.2075, 55.7447), "RUWAIS": (24.1102, 52.7306), "MADINAT ZAYED": (23.6588, 53.7081),
+    "UMM AL QUWAIN": (25.5647, 55.5552),
 }
+
+EMIRATES = ["Abu Dhabi", "Dubai", "Sharjah", "Ajman", "Umm Al Quwain", "Ras Al Khaimah", "Fujairah"]
 
 
 def build_hex_grid(boundary_path: Path):
@@ -84,36 +85,27 @@ def _num(v):
     return None if pd.isna(v) else round(float(v), 1)
 
 
-def _nearest_place(lon: float, lat: float) -> str:
-    best_name, best_dist = None, float("inf")
-    for name, (plat, plon) in PLACE_LABELS.items():
-        d = (lat - plat) ** 2 + (lon - plon) ** 2
-        if d < best_dist:
-            best_name, best_dist = name, d
-    return best_name.title()
-
-
 def build_zone_data(priority_path: Path, population_path: Path):
-    """Per-classified-zone data for the latest quarter, plus the 8-quarter Experience Index
-    history (for the trend sparkline) and the national KPI figures shown in the header strip."""
+    """Per-classified-zone data for *every* quarter (not just the latest -- the quarter
+    selector needs all 8), plus per-quarter KPIs and the 8-quarter Experience Index history
+    (for the trend sparkline, which is quarter-independent so computed once)."""
     df = pd.read_parquet(priority_path)
-    latest = df[df["quarter"] == LATEST_QUARTER]
-    classified = latest.loc[~latest["insufficient_evidence"]].copy()
+    classified_all = df.loc[~df["insufficient_evidence"]].copy()
 
-    cell_centers = {c: h3.cell_to_latlng(c) for c in classified["h3_cell"]}
+    cell_centers = {c: h3.cell_to_latlng(c) for c in classified_all["h3_cell"].unique()}
 
     history = (
-        df[df["h3_cell"].isin(classified["h3_cell"])]
+        df[df["h3_cell"].isin(classified_all["h3_cell"])]
         .sort_values("quarter")
         .groupby("h3_cell")["experience_index"]
         .apply(lambda s: [None if pd.isna(v) else round(float(v), 1) for v in s])
         .to_dict()
     )
 
-    zone_records = {}
-    for _, row in classified.iterrows():
+    def zone_record(row) -> dict:
         lat, lon = cell_centers[row["h3_cell"]]
-        zone_records[row["h3_cell"]] = {
+        return {
+            "emirate": row["emirate"],
             "peer_group": row["peer_group"],
             "experience_index": _num(row["experience_index"]),
             "confidence_score": _num(row["confidence_score"]),
@@ -141,51 +133,63 @@ def build_zone_data(priority_path: Path, population_path: Path):
             },
             "lat": round(lat, 4),
             "lon": round(lon, 4),
-            "nearest_place": _nearest_place(lon, lat),
             "sparkline": history.get(row["h3_cell"], []),
         }
 
-    top5 = (
-        classified.sort_values("priority_score", ascending=False)
-        .head(5)["h3_cell"].tolist()
-    )
-
+    zones_by_quarter, top5_by_quarter, kpis_by_quarter = {}, {}, {}
     population_all = pd.read_parquet(population_path)["population"].sum()
-    population_scored = classified["population"].sum()
-    prev_q = sorted(df["quarter"].unique())[-2]
-    prev_classified = df[(df["quarter"] == prev_q) & (~df["insufficient_evidence"])]
 
-    kpis = {
-        "scored_zones": len(classified),
-        "population_pct": round(100 * population_scored / population_all, 1),
-        "priority_zones": int(classified["priority_zone"].sum()),
-        "median_download": round(classified["download_mbps"].median(), 0),
-        "experience_qoq": round(
-            classified["experience_index"].median() - prev_classified["experience_index"].median(), 1
-        ),
-        "quarter_label": "Q2 2026",
-        "prev_quarter_label": prev_q,
-    }
+    for i, quarter in enumerate(QUARTER_ORDER):
+        classified = classified_all[classified_all["quarter"] == quarter]
+        if classified.empty:
+            continue
+        records = {row["h3_cell"]: zone_record(row) for _, row in classified.iterrows()}
+        zones_by_quarter[quarter] = records
+        top5_by_quarter[quarter] = (
+            classified.sort_values("priority_score", ascending=False).head(5)["h3_cell"].tolist()
+        )
+        prev_classified = classified_all[classified_all["quarter"] == QUARTER_ORDER[i - 1]] if i > 0 else None
+        kpis_by_quarter[quarter] = {
+            "scored_zones": len(classified),
+            "population_pct": round(float(100 * classified["population"].sum() / population_all), 1),
+            "priority_zones": int(classified["priority_zone"].sum()),
+            "median_download": round(float(classified["download_mbps"].median()), 0),
+            "experience_qoq": (
+                round(float(classified["experience_index"].median() - prev_classified["experience_index"].median()), 1)
+                if prev_classified is not None and not prev_classified.empty else None
+            ),
+        }
 
-    # Color-scale domains for the four layers, computed from the real data rather than
-    # hardcoded -- Priority has no natural fixed range, and Trend is clipped to the 5th/95th
-    # percentile magnitude so a couple of extreme zones (this data's trend slope ranges from
-    # -47 to +28 pts/qtr) don't wash out the color scale for everyone else.
-    trend_abs = classified["trend_pts_per_qtr"].dropna().abs()
+    # Population denominators for the "population represented" KPI under an emirate filter --
+    # each emirate's own full population universe, not just its measured/classified zones.
+    # Reads the authoritative emirate_zones_uae.parquet (covers every populated cell, not
+    # just Ookla-measured ones -- see scripts/build_emirate_field.py) rather than deriving a
+    # partial mapping from zone_priority.parquet, which would silently under-count any
+    # populated cell Ookla never sampled at all.
+    pop_df = pd.read_parquet(population_path)
+    emirate_zones = pd.read_parquet("data/processed/emirate_zones_uae.parquet")
+    pop_by_emirate = pop_df.merge(emirate_zones, on="h3_cell", how="left")
+    population_by_emirate = {"All UAE": int(population_all)}
+    for emirate in EMIRATES:
+        population_by_emirate[emirate] = int(pop_by_emirate.loc[pop_by_emirate["emirate"] == emirate, "population"].sum())
+
+    trend_abs = classified_all["trend_pts_per_qtr"].dropna().abs()
     domains = {
         "experience": [0, 100],
         "confidence": [0, 100],
-        "priority": [0, round(float(classified["priority_score"].max()), 1)],
+        "priority": [0, round(float(classified_all["priority_score"].max()), 1)],
         "trend": [round(float(-trend_abs.quantile(0.95)), 1), round(float(trend_abs.quantile(0.95)), 1)],
     }
 
-    return zone_records, top5, kpis, domains
+    return zones_by_quarter, top5_by_quarter, kpis_by_quarter, domains, population_by_emirate
 
 
-def render_html(hexagons, width, height, labels, zone_data, top5, kpis, domains) -> str:
+def render_html(hexagons, width, height, labels, zones_by_quarter, top5_by_quarter,
+                 kpis_by_quarter, domains, population_by_emirate) -> str:
     """Assembles the full self-contained HTML page: CSS for layout/theme, embedded JSON for
-    the hex grid + zone data, and vanilla JS for layer switching and zone drill-down. No chat/
-    copilot UI -- that's a separate capability, not part of this map."""
+    the hex grid + per-quarter zone data, and vanilla JS for layer/quarter/emirate switching
+    and zone drill-down. No chat/copilot UI -- that's a separate capability, not part of this
+    map."""
     hex_paths = "\n".join(
         f'<path id="hex-{h["id"]}" class="hex" d="{h["d"]}" onclick="selectZone(\'{h["id"]}\')"></path>'
         for h in hexagons
@@ -193,9 +197,11 @@ def render_html(hexagons, width, height, labels, zone_data, top5, kpis, domains)
     label_svg = "\n".join(
         f'<text class="place-label" x="{l["x"]}" y="{l["y"]}">{l["name"]}</text>' for l in labels
     )
-    qoq = kpis["experience_qoq"]
-    qoq_class = "stat-up" if qoq >= 0 else "stat-down"
-    qoq_sign = "+" if qoq >= 0 else ""
+    quarter_options = "\n".join(
+        f'<option value="{q}"{" selected" if q == QUARTER_ORDER[-1] else ""}>{q}</option>' for q in QUARTER_ORDER
+    )
+    emirate_options = "\n".join(f'<option value="{e}">{e}</option>' for e in EMIRATES)
+    latest_scored = kpis_by_quarter[QUARTER_ORDER[-1]]["scored_zones"]
 
     return f"""<!doctype html>
 <html lang="en">
@@ -214,7 +220,19 @@ def render_html(hexagons, width, height, labels, zone_data, top5, kpis, domains)
     <div class="subtitle">Outside-in public mobile-experience intelligence &middot; Mobile only &middot; Not e&amp; network data</div>
   </div>
   <div class="header-controls">
-    <div class="quarter-select">Quarter: <strong>{kpis['quarter_label']}</strong></div>
+    <div class="select-group">
+      <label for="quarter-select">Quarter</label>
+      <select id="quarter-select" onchange="setQuarter(this.value)">
+      {quarter_options}
+      </select>
+    </div>
+    <div class="select-group">
+      <label for="emirate-select">Emirate</label>
+      <select id="emirate-select" onchange="setEmirate(this.value)">
+        <option value="All UAE">All UAE</option>
+        {emirate_options}
+      </select>
+    </div>
     <div class="layer-buttons" id="layer-buttons">
       <button class="layer-btn active" data-layer="experience" onclick="setLayer('experience')">Experience</button>
       <button class="layer-btn" data-layer="priority" onclick="setLayer('priority')">Priority</button>
@@ -225,17 +243,11 @@ def render_html(hexagons, width, height, labels, zone_data, top5, kpis, domains)
 </header>
 
 <div class="disclaimer">
-  REAL PUBLIC OOKLA / WORLDPOP / OSM DATA &middot; {kpis['scored_zones']} OF ~15,700 ZONES MEET THE EVIDENCE THRESHOLD &middot;
+  REAL PUBLIC OOKLA / WORLDPOP / OSM DATA &middot; {latest_scored} OF ~15,700 ZONES MEET THE EVIDENCE THRESHOLD (LATEST QUARTER) &middot;
   NOT E&amp; NETWORK DATA &middot; PROTOTYPE, PRE-VALIDATION
 </div>
 
-<div class="kpi-strip">
-  <div class="kpi"><div class="kpi-value">{kpis['scored_zones']}</div><div class="kpi-label">Scored zones</div><div class="kpi-sub">meeting the evidence threshold</div></div>
-  <div class="kpi"><div class="kpi-value">{kpis['population_pct']}%</div><div class="kpi-label">Population represented</div><div class="kpi-sub">est. residents in scored zones</div></div>
-  <div class="kpi"><div class="kpi-value" style="color:var(--accent)">{kpis['priority_zones']}</div><div class="kpi-label">Priority zones</div><div class="kpi-sub">flagged for investigation (top 10%)</div></div>
-  <div class="kpi"><div class="kpi-value">{kpis['median_download']:.0f}<span class="kpi-unit">Mbps</span></div><div class="kpi-label">Median download</div><div class="kpi-sub">across scored zones</div></div>
-  <div class="kpi"><div class="kpi-value {qoq_class}">{qoq_sign}{qoq}<span class="kpi-unit">pts</span></div><div class="kpi-label">Experience Index QoQ</div><div class="kpi-sub">vs {kpis['prev_quarter_label']}</div></div>
-</div>
+<div class="kpi-strip" id="kpi-strip"></div>
 
 <main>
   <div class="map-pane">
@@ -252,7 +264,7 @@ def render_html(hexagons, width, height, labels, zone_data, top5, kpis, domains)
 
   <aside class="side-panel">
     <div class="panel-block">
-      <div class="panel-title">This quarter &middot; top priority zones</div>
+      <div class="panel-title" id="priority-list-title">This quarter &middot; top priority zones</div>
       <ol class="priority-list" id="priority-list"></ol>
     </div>
     <div class="panel-block zone-detail" id="zone-detail"></div>
@@ -260,15 +272,19 @@ def render_html(hexagons, width, height, labels, zone_data, top5, kpis, domains)
 </main>
 
 <footer>
-  Sources: &copy; OpenStreetMap contributors (ODbL) &middot; WorldPop (CC BY 4.0) &middot;
-  Ookla Speedtest Open Data (CC BY-NC-SA 4.0, non-commercial research/education use only) &middot;
-  H3 resolution 7 &middot; {kpis['quarter_label']}
+  &copy; OpenStreetMap contributors (ODbL) &middot; WorldPop (CC BY 4.0) &middot;
+  Ookla Speedtest Open Data, aggregated from S3 parquet/performance/type=mobile,
+  2024 Q3 &ndash; 2026 Q2 (CC BY-NC-SA 4.0, non-commercial research/education use only) &middot;
+  H3 resolution 7
 </footer>
 
 <script>
-const ZONES = {json.dumps(zone_data)};
-const TOP5 = {json.dumps(top5)};
+const QUARTER_ORDER = {json.dumps(QUARTER_ORDER)};
+const ZONES_BY_QUARTER = {json.dumps(zones_by_quarter)};
+const TOP5_BY_QUARTER = {json.dumps(top5_by_quarter)};
+const KPIS_BY_QUARTER = {json.dumps(kpis_by_quarter)};
 const DOMAINS = {json.dumps(domains)};
+const POPULATION_BY_EMIRATE = {json.dumps(population_by_emirate)};
 {_JS}
 </script>
 
@@ -284,11 +300,13 @@ _CSS = """
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif; font-size: 14px; }
-header { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--border); }
+header { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; gap: 10px; }
 h1 { font-size: 17px; margin: 0; letter-spacing: 0.2px; }
 .subtitle { font-size: 10.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
-.header-controls { display: flex; align-items: center; gap: 18px; }
-.quarter-select { font-size: 12px; color: var(--text-dim); }
+.header-controls { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.select-group { display: flex; flex-direction: column; gap: 2px; }
+.select-group label { font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--text-dim); }
+.select-group select { font-size: 12px; padding: 4px 6px; border-radius: 5px; border: 1px solid var(--border); background: var(--panel); color: var(--text); }
 .layer-buttons { display: flex; gap: 4px; background: var(--bg); padding: 3px; border-radius: 7px; }
 .layer-btn { border: none; background: transparent; padding: 6px 14px; font-size: 12px; font-weight: 600; border-radius: 5px; cursor: pointer; color: var(--text-dim); }
 .layer-btn.active { background: var(--accent); color: #fff; }
@@ -300,12 +318,13 @@ h1 { font-size: 17px; margin: 0; letter-spacing: 0.2px; }
 .kpi-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--text-dim); margin-top: 2px; }
 .kpi-sub { font-size: 10.5px; color: var(--text-dim); opacity: 0.8; }
 .stat-up { color: #1a9850; } .stat-down { color: var(--accent); }
-main { display: flex; height: calc(100vh - 168px); min-height: 520px; }
+main { display: flex; height: calc(100vh - 190px); min-height: 520px; }
 .map-pane { flex: 1; position: relative; background: #fbfbfc; overflow: hidden; }
 #map-svg { width: 100%; height: 100%; display: block; }
-.hex { fill: var(--grey-hex); stroke: var(--stroke); stroke-width: 0.4; cursor: pointer; transition: fill 0.15s; }
+.hex { fill: var(--grey-hex); stroke: var(--stroke); stroke-width: 0.4; cursor: pointer; transition: fill 0.15s, opacity 0.15s; }
 .hex:hover { stroke: #999; stroke-width: 1; }
 .hex.selected { stroke: var(--accent); stroke-width: 2.2; }
+.hex.dimmed { opacity: 0.12; }
 .place-label { font-size: 7px; fill: #9a9aa2; letter-spacing: 0.5px; text-transform: uppercase; pointer-events: none; }
 .legend { position: absolute; left: 14px; bottom: 14px; background: rgba(255,255,255,0.92); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 10.5px; width: 190px; }
 .legend-title { font-weight: 600; text-transform: uppercase; font-size: 9.5px; color: var(--text-dim); margin-bottom: 5px; }
@@ -325,6 +344,7 @@ main { display: flex; height: calc(100vh - 168px); min-height: 520px; }
 .priority-name { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .priority-meta { font-size: 10.5px; color: var(--text-dim); }
 .priority-score { background: var(--accent); color: #fff; font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 10px; flex-shrink: 0; }
+.empty-note { font-size: 11.5px; color: var(--text-dim); padding: 6px 2px; }
 .zone-detail { flex: 1; }
 .zd-region { font-size: 10.5px; color: var(--text-dim); text-transform: uppercase; }
 .zd-name { font-size: 15px; font-weight: 700; margin: 3px 0 6px; }
@@ -354,6 +374,8 @@ footer { padding: 8px 20px; font-size: 10px; color: var(--text-dim); background:
 
 _JS = """
 let currentLayer = 'experience';
+let currentQuarter = QUARTER_ORDER[QUARTER_ORDER.length - 1];
+let currentEmirate = 'All UAE';
 let selectedZone = null;
 
 function lerp(a, b, t) { return a + (b - a) * t; }
@@ -382,10 +404,17 @@ const LAYER_CONFIG = {
   confidence: { field: 'confidence_score', label: 'Confidence (0-100)', kind: 'sequential', light: [232,240,253], dark: [30,64,150], hint: 'higher = more test evidence behind the score' },
 };
 
-function colorFor(id, layer) {
-  const z = ZONES[id];
+function currentZones() {
+  return ZONES_BY_QUARTER[currentQuarter] || {};
+}
+
+function visibleZoneEntries() {
+  const zones = currentZones();
+  return Object.entries(zones).filter(([id, z]) => currentEmirate === 'All UAE' || z.emirate === currentEmirate);
+}
+
+function colorFor(z, layer) {
   const cfg = LAYER_CONFIG[layer];
-  if (!z) return null;
   const v = z[cfg.field];
   if (v === null || v === undefined) return null;
   const [lo, hi] = DOMAINS[layer];
@@ -397,10 +426,15 @@ function colorFor(id, layer) {
 
 function renderLayer() {
   const cfg = LAYER_CONFIG[currentLayer];
-  for (const id in ZONES) {
+  const zones = currentZones();
+  const filterActive = currentEmirate !== 'All UAE';
+  for (const id in zones) {
     const el = document.getElementById('hex-' + id);
     if (!el) continue;
-    const c = colorFor(id, currentLayer);
+    const z = zones[id];
+    const inFilter = !filterActive || z.emirate === currentEmirate;
+    el.classList.toggle('dimmed', filterActive && !inFilter);
+    const c = colorFor(z, currentLayer);
     el.style.fill = c || '#e3e3e6';
   }
   renderLegend(cfg);
@@ -421,10 +455,58 @@ function renderLegend(cfg) {
   `;
 }
 
+function renderKpis() {
+  const entries = visibleZoneEntries();
+  const filterActive = currentEmirate !== 'All UAE';
+  const popDenom = POPULATION_BY_EMIRATE[currentEmirate];
+  const popSum = entries.reduce((s, [, z]) => s + z.population, 0);
+  const priorityCount = entries.filter(([, z]) => z.priority_zone).length;
+  const downloads = entries.map(([, z]) => z.download_mbps).sort((a, b) => a - b);
+  const medianDownload = downloads.length ? downloads[Math.floor(downloads.length / 2)] : 0;
+
+  const idx = QUARTER_ORDER.indexOf(currentQuarter);
+  let qoq = null;
+  if (idx > 0) {
+    const prevEntries = Object.entries(ZONES_BY_QUARTER[QUARTER_ORDER[idx - 1]] || {})
+      .filter(([id, z]) => !filterActive || z.emirate === currentEmirate);
+    if (prevEntries.length && entries.length) {
+      const med = arr => { const s = arr.slice().sort((a,b)=>a-b); return s[Math.floor(s.length/2)]; };
+      qoq = Math.round((med(entries.map(([,z])=>z.experience_index)) - med(prevEntries.map(([,z])=>z.experience_index))) * 10) / 10;
+    }
+  }
+  const qoqClass = qoq === null ? '' : (qoq >= 0 ? 'stat-up' : 'stat-down');
+  const qoqSign = qoq !== null && qoq >= 0 ? '+' : '';
+  const qoqDisplay = qoq === null ? '&ndash;' : `${qoqSign}${qoq}<span class="kpi-unit">pts</span>`;
+  const prevLabel = idx > 0 ? QUARTER_ORDER[idx - 1] : '–';
+
+  document.getElementById('kpi-strip').innerHTML = `
+    <div class="kpi"><div class="kpi-value">${entries.length}</div><div class="kpi-label">Scored zones</div><div class="kpi-sub">meeting the evidence threshold</div></div>
+    <div class="kpi"><div class="kpi-value">${popDenom ? Math.round(1000*popSum/popDenom)/10 : 0}%</div><div class="kpi-label">Population represented</div><div class="kpi-sub">est. residents in scored zones</div></div>
+    <div class="kpi"><div class="kpi-value" style="color:var(--accent)">${priorityCount}</div><div class="kpi-label">Priority zones</div><div class="kpi-sub">flagged nationally, shown in view</div></div>
+    <div class="kpi"><div class="kpi-value">${medianDownload.toFixed(0)}<span class="kpi-unit">Mbps</span></div><div class="kpi-label">Median download</div><div class="kpi-sub">across scored zones in view</div></div>
+    <div class="kpi"><div class="kpi-value ${qoqClass}">${qoqDisplay}</div><div class="kpi-label">Experience Index QoQ</div><div class="kpi-sub">vs ${prevLabel}</div></div>
+  `;
+}
+
 function setLayer(layer) {
   currentLayer = layer;
   document.querySelectorAll('.layer-btn').forEach(b => b.classList.toggle('active', b.dataset.layer === layer));
   renderLayer();
+}
+
+function setQuarter(q) {
+  currentQuarter = q;
+  renderLayer();
+  renderKpis();
+  renderPriorityList();
+  if (selectedZone) selectZone(selectedZone);
+}
+
+function setEmirate(e) {
+  currentEmirate = e;
+  renderLayer();
+  renderKpis();
+  renderPriorityList();
 }
 
 function sparklineSvg(values) {
@@ -443,8 +525,6 @@ function sparklineSvg(values) {
 }
 
 function shortId(id) {
-  // H3 cell IDs share a common trailing "fffff" padding (unused resolution digits), so a
-  // plain slice(-6) shows the same suffix for every zone -- strip that padding first.
   const trimmed = id.replace(/f+$/, '');
   return trimmed.slice(-6);
 }
@@ -464,7 +544,7 @@ function selectZone(id) {
 
   document.querySelectorAll('.priority-item').forEach(li => li.classList.toggle('selected', li.dataset.id === id));
 
-  const z = ZONES[id];
+  const z = currentZones()[id];
   const panel = document.getElementById('zone-detail');
   if (!z) {
     panel.innerHTML = `
@@ -478,7 +558,7 @@ function selectZone(id) {
     return;
   }
   panel.innerHTML = `
-    <div class="zd-region">${z.nearest_place} (nearest) &middot; H3 ${id} &middot; Q2 2026</div>
+    <div class="zd-region">${z.emirate} &middot; H3 ${id} &middot; ${currentQuarter}</div>
     <div class="zd-name">Zone ${shortId(id)}</div>
     <div class="zd-tags">
       <span class="tag">Peer: ${z.peer_group}</span>
@@ -518,13 +598,34 @@ function selectZone(id) {
 }
 
 function renderPriorityList() {
+  const filterActive = currentEmirate !== 'All UAE';
+  const title = document.getElementById('priority-list-title');
   const list = document.getElementById('priority-list');
-  list.innerHTML = TOP5.map((id, i) => {
-    const z = ZONES[id];
+
+  let ranked;
+  if (!filterActive) {
+    title.textContent = `${currentQuarter} · top priority zones (national)`;
+    ranked = TOP5_BY_QUARTER[currentQuarter] || [];
+  } else {
+    title.textContent = `${currentQuarter} · top priority zones in ${currentEmirate}`;
+    ranked = visibleZoneEntries()
+      .sort((a, b) => b[1].priority_score - a[1].priority_score)
+      .slice(0, 5)
+      .map(([id]) => id);
+  }
+
+  if (!ranked.length) {
+    list.innerHTML = '<div class="empty-note">No classified zones for this emirate/quarter combination.</div>';
+    return;
+  }
+
+  list.innerHTML = ranked.map((id, i) => {
+    const z = currentZones()[id];
+    if (!z) return '';
     return `<li class="priority-item" data-id="${id}" onclick="selectZone('${id}')">
       <div class="priority-rank">${i + 1}</div>
       <div class="priority-info">
-        <div class="priority-name">${z.nearest_place} area &middot; ${shortId(id)}</div>
+        <div class="priority-name">${z.emirate} &middot; ${shortId(id)}</div>
         <div class="priority-meta">${z.peer_group} &middot; Exp ${z.experience_index} &middot; Conf ${z.confidence_score}%</div>
       </div>
       <div class="priority-score">P${Math.round(z.priority_score)}</div>
@@ -532,23 +633,27 @@ function renderPriorityList() {
   }).join('');
 }
 
+renderKpis();
 renderPriorityList();
 renderLayer();
-selectZone(TOP5[0]);
+const initialTop5 = TOP5_BY_QUARTER[currentQuarter] || [];
+if (initialTop5.length) selectZone(initialTop5[0]);
 """
 
 
 def main():
     hexagons, project, width, height, labels = build_hex_grid(Path("data/raw/boundary/uae_boundary.geojson"))
-    zone_data, top5, kpis, domains = build_zone_data(
+    zones_by_quarter, top5_by_quarter, kpis_by_quarter, domains, population_by_emirate = build_zone_data(
         Path("data/processed/zone_priority.parquet"), Path("data/processed/population_zones_uae.parquet")
     )
-    html = render_html(hexagons, width, height, labels, zone_data, top5, kpis, domains)
+    html = render_html(hexagons, width, height, labels, zones_by_quarter, top5_by_quarter,
+                        kpis_by_quarter, domains, population_by_emirate)
 
     out_path = Path("data/processed/uae_dashboard.html")
     out_path.write_text(html, encoding="utf-8")
     print(f"Saved: {out_path} ({out_path.stat().st_size / 1024:.1f} KB)")
-    print(f"Hexagons drawn: {len(hexagons)} | classified zones: {len(zone_data)}")
+    print(f"Hexagons drawn: {len(hexagons)} | quarters with data: {len(zones_by_quarter)}")
+    print(f"Latest quarter classified zones: {kpis_by_quarter[list(kpis_by_quarter)[-1]]['scored_zones']}")
 
 
 if __name__ == "__main__":
