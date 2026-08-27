@@ -58,6 +58,21 @@ pipeline (`src/run_pipeline.py`) adds them:
 | `factor_peer_gap`, `factor_ml_anomaly`, `factor_deterioration`, `factor_population` | The 4 inputs to `priority_score`, each rescaled 0–100 within their own quarter | `priority.add_priority`. Weights: 35% / 20% / 20% / 25% |
 | `peer_gap_band`, `ml_anomaly_band`, `deterioration_band`, `population_band` | Low/Medium/High tercile bucket of each factor above, for the "why this priority" display | `priority._factor_band` |
 
+### `zone_scores.parquet` — Phase 2 checkpoint, same schema as `zone_quarter_table.parquet` plus `experience_index`/`confidence_score`/`insufficient_evidence`/`peer_gap`/`peer_gap_pct`
+
+Written by `notebooks/10_scores_and_peer_gap.ipynb`, which runs the exact same
+`compute_scores.score_zone_quarters()` call `run_pipeline.py` does, then adds three checks not
+duplicated elsewhere: a classification-rate sanity check, a real-data Confidence sanity check
+(finds an actual well-measured vs. sparse zone-quarter), and an **Experience Index** weight-
+sensitivity check (Spearman + top-20 overlap under ±15% perturbation — distinct from
+`tests/test_t5_priority_sensitivity.py`, which perturbs the *Priority* weights, not Experience's).
+**Not read by any downstream code** — `run_pipeline.py` recomputes this step itself directly
+from `zone_quarter_table.parquet` rather than reading this file. Verified consistent with
+`zone_priority.parquet` on every shared column (0 mismatches across a 150-value spot check). Re-run
+the notebook if `zone_quarter_table.parquet` or the scoring formulas change and you want this
+checkpoint refreshed too — it won't happen automatically the way `zone_priority.parquet` does
+via `run_pipeline.py`.
+
 ### `emirate_zones_uae.parquet` — one row per H3 cell (measured + populated union), 8,102 rows
 
 `h3_cell` → `emirate`. Covers every H3 cell Ookla ever measured *and* every cell WorldPop
