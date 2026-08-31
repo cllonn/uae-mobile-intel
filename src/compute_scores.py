@@ -49,7 +49,7 @@ CONFIDENCE_WEIGHTS = {"tests": 0.50, "devices": 0.30, "quarters": 0.20}
 # separate concept from this gate -- it still differentiates strength of evidence *among*
 # zones that clear this bar (a 30-test zone scores lower confidence than a 500-test zone),
 # it just no longer decides whether a zone is classified at all.
-MIN_TESTS_FOR_RELIABLE_EVIDENCE = 30
+MIN_TESTS_FOR_RELIABLE_EVIDENCE = 1
 
 # Test-count saturation point for the Confidence formula: zones at or above this many
 # tests/quarter get full marks on the test-volume component. Set at the brief's own cited

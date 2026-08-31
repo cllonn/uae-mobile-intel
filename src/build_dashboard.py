@@ -24,7 +24,12 @@ import geopandas as gpd
 import h3
 import pandas as pd
 
-MAP_H3_RESOLUTION = 7  # matches every other notebook in the pipeline
+
+# Single source of truth for the pipeline's H3 resolution, same file every other notebook reads
+# (notebooks/04_h3_resolution_choice.ipynb writes it) -- reading it here rather than hardcoding
+# a second copy is what keeps this file's hex geometry from silently drifting out of sync with
+# the `h3_cell` IDs in zone_priority.parquet if the chosen resolution ever changes again.
+MAP_H3_RESOLUTION = json.loads(Path("data/processed/h3_resolution.json").read_text())["chosen_resolution"]
 QUARTER_ORDER = ["2024Q3", "2024Q4", "2025Q1", "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2"]
 MAP_WIDTH = 900
 
@@ -42,9 +47,20 @@ PLACE_LABELS = {
 EMIRATES = ["Abu Dhabi", "Dubai", "Sharjah", "Ajman", "Umm Al Quwain", "Ras Al Khaimah", "Fujairah"]
 
 
-def build_hex_grid(boundary_path: Path):
-    """Every H3 res-7 hexagon covering the UAE, as an SVG path string in the shared pixel
-    projection. Returns (list of {id, path}, projection function, viewBox width/height)."""
+def build_hex_grid(boundary_path: Path, extra_cells=None):
+    """Every H3 hexagon (at MAP_H3_RESOLUTION) covering the UAE, as an SVG path string in the
+    shared pixel projection. Returns (list of {id, path}, projection function, viewBox width/height).
+
+    `extra_cells` (optional): H3 cell IDs to guarantee a polygon for even if `polygon_to_cells`
+    didn't produce them. `polygon_to_cells` includes a cell only if its own CENTROID falls
+    inside the boundary polygon -- a different test than `h3.latlng_to_cell(tile_lat, tile_lon)`,
+    which is what actually assigns a real measurement to a cell in `05_zone_aggregation.ipynb`.
+    At resolution 6's larger (~36 km^2) hexagons, a real classified zone can hold a genuine,
+    boundary-clipped measurement while its centroid sits just outside the exact coastline/border
+    polygon -- 49 of 671 classified 2026Q2 zones, including the #1 nationally-ranked priority
+    zone, were missing a polygon for exactly this reason before this parameter existed. Pass every
+    zone ID that ever appears in `zone_priority.parquet` here so no classified zone is ever
+    unselectable on the map."""
     uae = gpd.read_file(boundary_path).to_crs("EPSG:4326")
     shape = uae.geometry.iloc[0]
     min_lon, min_lat, max_lon, max_lat = shape.bounds
@@ -64,7 +80,9 @@ def build_hex_grid(boundary_path: Path):
     for part in shape.geoms:
         ring = [(lat, lon) for lon, lat in part.exterior.coords]
         polys.append(h3.LatLngPoly(ring))
-    all_cells = h3.polygon_to_cells(h3.LatLngMultiPoly(*polys), MAP_H3_RESOLUTION)
+    all_cells = set(h3.polygon_to_cells(h3.LatLngMultiPoly(*polys), MAP_H3_RESOLUTION))
+    if extra_cells:
+        all_cells |= set(extra_cells)
 
     hexagons = []
     for cell in all_cells:
@@ -275,7 +293,7 @@ def render_html(hexagons, width, height, labels, zones_by_quarter, top5_by_quart
   &copy; OpenStreetMap contributors (ODbL) &middot; WorldPop (CC BY 4.0) &middot;
   Ookla Speedtest Open Data, aggregated from S3 parquet/performance/type=mobile,
   2024 Q3 &ndash; 2026 Q2 (CC BY-NC-SA 4.0, non-commercial research/education use only) &middot;
-  H3 resolution 7
+  H3 resolution {MAP_H3_RESOLUTION}
 </footer>
 
 <script>
@@ -321,10 +339,17 @@ h1 { font-size: 17px; margin: 0; letter-spacing: 0.2px; }
 main { display: flex; height: calc(100vh - 190px); min-height: 520px; }
 .map-pane { flex: 1; position: relative; background: #fbfbfc; overflow: hidden; }
 #map-svg { width: 100%; height: 100%; display: block; }
-.hex { fill: var(--grey-hex); stroke: var(--stroke); stroke-width: 0.4; cursor: pointer; transition: fill 0.15s, opacity 0.15s; }
+.hex { fill: var(--grey-hex); stroke: var(--stroke); stroke-width: 0.4; cursor: pointer; transition: fill 0.15s; }
 .hex:hover { stroke: #999; stroke-width: 1; }
-.hex.selected { stroke: var(--accent); stroke-width: 2.2; }
-.hex.dimmed { opacity: 0.12; }
+/* Selection is purely visual: a CSS transform scales the rendered SVG path around its own
+   fill-box center (transform-box: fill-box) -- it never touches the path's `d` coordinates,
+   so the real H3 geometry/area is untouched. 1.04 sits in the requested 103-105% band: the
+   smallest bump that reads as "selected" next to same-color neighbors without looking like a
+   size change in the underlying data. No transition on `transform` anywhere on `.hex` --
+   selecting and deselecting both snap instantly, on purpose (no grow/shrink/fade animation in
+   either direction). Re-appended to the end of its parent in JS on selection so the enlarged
+   hex draws on top of (not clipped under) its neighbors. */
+.hex.selected { stroke: var(--accent); stroke-width: 2.2; transform-box: fill-box; transform-origin: center; transform: scale(1.04); }
 .place-label { font-size: 7px; fill: #9a9aa2; letter-spacing: 0.5px; text-transform: uppercase; pointer-events: none; }
 .legend { position: absolute; left: 14px; bottom: 14px; background: rgba(255,255,255,0.92); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 10.5px; width: 190px; }
 .legend-title { font-weight: 600; text-transform: uppercase; font-size: 9.5px; color: var(--text-dim); margin-bottom: 5px; }
@@ -428,15 +453,25 @@ function renderLayer() {
   const cfg = LAYER_CONFIG[currentLayer];
   const zones = currentZones();
   const filterActive = currentEmirate !== 'All UAE';
-  for (const id in zones) {
-    const el = document.getElementById('hex-' + id);
-    if (!el) continue;
+  // Must visit every hexagon physically drawn on the map, not just the ones with a record in
+  // `zones` (the current quarter) -- one row is one (h3_cell, quarter) pair, so a hex with no
+  // entry here has no valid analytical value THIS quarter, full stop, even if it was colored a
+  // moment ago under a different quarter. Only touching `zones`' own keys left every other hex's
+  // last-painted `style.fill` sitting there untouched, which is exactly how a previous quarter's
+  // (or a previous layer's) color kept "surviving" a quarter change.
+  document.querySelectorAll('.hex').forEach(el => {
+    const id = el.id.slice(4); // strip the 'hex-' prefix
     const z = zones[id];
+    if (!z) {
+      el.style.fill = '#e3e3e6'; // no record for this h3_cell in this quarter -- never inherit an old one
+      return;
+    }
     const inFilter = !filterActive || z.emirate === currentEmirate;
-    el.classList.toggle('dimmed', filterActive && !inFilter);
-    const c = colorFor(z, currentLayer);
-    el.style.fill = c || '#e3e3e6';
-  }
+    // Out-of-filter zones fall back to the same neutral grey as a genuinely unclassified
+    // hex (never a faded version of their real color) -- an emirate filter must mean "no
+    // other emirate's analytical value is shown," not "shown a little less."
+    el.style.fill = inFilter ? (colorFor(z, currentLayer) || '#e3e3e6') : '#e3e3e6';
+  });
   renderLegend(cfg);
 }
 
@@ -494,12 +529,44 @@ function setLayer(layer) {
   renderLayer();
 }
 
+// One shared selection state (`selectedZone`) drives the map hex, the priority-list row
+// highlight, and the details panel alike -- a quarter/emirate change never invents a second
+// selection concept, it only re-validates the same one against the new view.
+function clearSelection() {
+  if (selectedZone) {
+    const prevEl = document.getElementById('hex-' + selectedZone);
+    if (prevEl) prevEl.classList.remove('selected');
+  }
+  selectedZone = null;
+  document.querySelectorAll('.priority-item').forEach(li => li.classList.remove('selected'));
+  document.getElementById('zone-detail').innerHTML =
+    '<div class="empty-note">Click a hexagon, or a zone in the priority list, to see its details.</div>';
+}
+
+function refreshSelection() {
+  if (!selectedZone) return;
+  const filterActive = currentEmirate !== 'All UAE';
+  const raw = currentZones()[selectedZone];
+  // A zone with no data THIS quarter still physically exists (every hexagon is a fixed
+  // geographic cell, drawn at every quarter) -- selectZone already renders an honest "no
+  // classification this quarter" panel for that, so it stays selected. A zone that belongs to
+  // a DIFFERENT emirate than the active filter is different: it's now drawn as plain
+  // background grey (never colored), so keeping it "selected" would leave an enlarged,
+  // highlighted hexagon with a details panel for a zone the view no longer shows -- exactly
+  // the stale-selection state that must not happen. Clear it instead.
+  if (filterActive && raw && raw.emirate !== currentEmirate) {
+    clearSelection();
+  } else {
+    selectZone(selectedZone);
+  }
+}
+
 function setQuarter(q) {
   currentQuarter = q;
   renderLayer();
   renderKpis();
   renderPriorityList();
-  if (selectedZone) selectZone(selectedZone);
+  refreshSelection();
 }
 
 function setEmirate(e) {
@@ -507,6 +574,7 @@ function setEmirate(e) {
   renderLayer();
   renderKpis();
   renderPriorityList();
+  refreshSelection();
 }
 
 function sparklineSvg(values) {
@@ -540,14 +608,32 @@ function selectZone(id) {
   }
   selectedZone = id;
   const el = document.getElementById('hex-' + id);
-  if (el) el.classList.add('selected');
+  if (el) {
+    el.classList.add('selected');
+    // SVG stacking order is DOM order, not z-index -- re-appending moves this <path> to the
+    // end of its parent so the enlarged hex draws over its neighbors instead of being
+    // partly hidden under them. A DOM reorder only, never touches the path's `d` coordinates.
+    el.parentNode.appendChild(el);
+  }
 
   document.querySelectorAll('.priority-item').forEach(li => li.classList.toggle('selected', li.dataset.id === id));
 
-  const z = currentZones()[id];
+  const filterActive = currentEmirate !== 'All UAE';
+  const raw = currentZones()[id];
+  // A zone that exists but belongs to a different emirate than the active filter must not
+  // open its real data panel either -- the map already shows it as plain background grey,
+  // and the panel has to agree, not leak another emirate's numbers through a click.
+  const outOfFilter = !!raw && filterActive && raw.emirate !== currentEmirate;
+  const z = outOfFilter ? null : raw;
   const panel = document.getElementById('zone-detail');
   if (!z) {
-    panel.innerHTML = `
+    panel.innerHTML = outOfFilter ? `
+      <div class="zd-region">H3 zone &middot; ${id}</div>
+      <div class="zd-name">Outside the current emirate filter</div>
+      <div class="insufficient-msg">
+        This hexagon belongs to ${raw.emirate}, not ${currentEmirate}. Switch the Emirate filter
+        to ${raw.emirate} (or "All UAE") to see its data.
+      </div>` : `
       <div class="zd-region">H3 zone &middot; ${id}</div>
       <div class="zd-name">No classification this quarter</div>
       <div class="insufficient-msg">
@@ -642,7 +728,12 @@ if (initialTop5.length) selectZone(initialTop5[0]);
 
 
 def main():
-    hexagons, project, width, height, labels = build_hex_grid(Path("data/raw/boundary/uae_boundary.geojson"))
+    all_data_cells = pd.read_parquet(
+        Path("data/processed/zone_priority.parquet"), columns=["h3_cell"]
+    )["h3_cell"].unique().tolist()
+    hexagons, project, width, height, labels = build_hex_grid(
+        Path("data/raw/boundary/uae_boundary.geojson"), extra_cells=all_data_cells
+    )
     zones_by_quarter, top5_by_quarter, kpis_by_quarter, domains, population_by_emirate = build_zone_data(
         Path("data/processed/zone_priority.parquet"), Path("data/processed/population_zones_uae.parquet")
     )

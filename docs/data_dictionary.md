@@ -14,14 +14,14 @@ actual parquet columns — verified against the live files, not written from mem
 
 ## Processed tables
 
-### `zone_quarter_table.parquet` — one row per (H3 res-7 cell, quarter), 13,597 rows
+### `zone_quarter_table.parquet` — one row per (H3 res-6 cell, quarter), 5,011 rows
 
 The master pre-scoring join: Ookla (per-quarter) + WorldPop (static) + OSM density (static) +
 peer group (static) + emirate (static).
 
 | Field | Meaning | Source / transformation |
 |---|---|---|
-| `h3_cell` | H3 resolution-7 cell ID | Ookla tile lat/lon → `h3.latlng_to_cell` |
+| `h3_cell` | H3 resolution-6 cell ID | Ookla tile lat/lon → `h3.latlng_to_cell` |
 | `quarter` | e.g. `"2026Q2"` | Ookla file's year/quarter |
 | `n_tiles` | Number of raw ~610m Ookla tiles aggregated into this cell-quarter | Count from `01_ookla_collection.ipynb` |
 | `tests`, `devices` | Test count / device count, summed across tiles in the cell | Raw Ookla, test-weighted sum (`05_zone_aggregation.ipynb`) — `devices` is an upper-bound proxy (no device ID in the public dataset, so a device active in two tiles is counted twice) |
@@ -45,7 +45,7 @@ pipeline (`src/run_pipeline.py`) adds them:
 | `quarters_observed` | How many of the 8 quarters this zone has any measurement in | `compute_scores.add_quarters_observed` |
 | `experience_index` | 0–100 deterministic score: 50% download + 20% upload + 30% inverse latency, each min-max normalized (1st/99th percentile clipped) | `compute_scores.experience_index`. **NaN if `insufficient_evidence`.** |
 | `confidence_score` | 0–100: 50% log-scaled test volume + 30% devices/tests ratio + 20% quarters-observed fraction | `compute_scores.confidence_score` |
-| `insufficient_evidence` | `True` if `tests < 30` (`MIN_TESTS_FOR_RELIABLE_EVIDENCE` in `compute_scores.py`) | The single authoritative eligibility gate — every score/flag below is only computed for `insufficient_evidence == False` rows |
+| `insufficient_evidence` | `True` if `tests < MIN_TESTS_FOR_RELIABLE_EVIDENCE` in `compute_scores.py` (currently `1`, not the `30` used when these docs were first written — see `docs/validation_summary.md`) | The single authoritative eligibility gate — every score/flag below is only computed for `insufficient_evidence == False` rows |
 | `peer_group_median_experience` | Median Experience Index of this zone's `(peer_group, quarter)`, computed from classified zones only | `compute_scores.peer_gap` |
 | `peer_gap`, `peer_gap_pct` | `experience_index` − peer median, in points and % | `compute_scores.peer_gap` |
 | `deteriorating` | `True` if this quarter closes 3 consecutive quarter-over-quarter declines in `peer_gap` | `trends.add_trend`. **Scoped per quarter** — not "has this zone ever declined," see `docs/validation_summary.md` |
@@ -73,7 +73,7 @@ the notebook if `zone_quarter_table.parquet` or the scoring formulas change and 
 checkpoint refreshed too — it won't happen automatically the way `zone_priority.parquet` does
 via `run_pipeline.py`.
 
-### `emirate_zones_uae.parquet` — one row per H3 cell (measured + populated union), 8,102 rows
+### `emirate_zones_uae.parquet` — one row per H3 cell (measured + populated union), 1,869 rows
 
 `h3_cell` → `emirate`. Covers every H3 cell Ookla ever measured *and* every cell WorldPop
 records population in (not just measured ones) — needed so per-emirate population

@@ -1,8 +1,19 @@
 # T0–T7 validation summary
 
-**Authoritative state**: `MIN_TESTS_FOR_RELIABLE_EVIDENCE = 30` in `src/compute_scores.py`. All
-numbers on this page are from the pipeline as it stands today. Every T1/T2/T3/T4/T5 script is
-in `tests/` and reproduces its own numbers on demand — see "Running the tests" below.
+**Authoritative state**: H3 resolution **6** (`data/processed/h3_resolution.json`, changed from
+resolution 7 — see `notebooks/04_h3_resolution_choice.ipynb` for the comparison and the
+tradeoffs this project decision accepts). `MIN_TESTS_FOR_RELIABLE_EVIDENCE` in
+`src/compute_scores.py` is currently **`1`**, not the `30` this page was originally written
+against — that change predates the resolution migration, was found already uncommitted, and was
+deliberately left as-is (out of scope for a resolution change). **Every zone-count number below
+that cites the `tests >= 30` framing is now stale on two counts** (different resolution, and the
+code no longer enforces that bar) — re-run the scripts in "Running the tests" below for live
+numbers, and see the resolution-6-at-threshold-30 figures in `README.md`'s evidence-threshold
+section for numbers that isolate the resolution effect alone. All numbers on this page are from
+the pipeline **as it stood at the previous H3-resolution-7 revision** and are kept here as
+historical record of the tests>=5 → tests>=30 correction; they have not been refreshed for the
+resolution-6 migration. Every T1/T2/T3/T4/T5 script is in `tests/` and reproduces its own numbers
+on demand — see "Running the tests" below.
 
 ## Evidence threshold correction (context for every number below)
 

@@ -10,15 +10,19 @@ density, used to group similar areas together, and the real emirate boundaries).
 
 ### H3 geographic zones
 
-We aggregate individual measurements into hexagonal zones (H3 resolution 7, ~5 km² each) —
-chosen empirically by testing which resolution gives stable, well-supported scores.
+We aggregate individual measurements into hexagonal zones (H3 resolution 6, ~36 km² each) — the
+project's chosen geographic unit; see `notebooks/04_h3_resolution_choice.ipynb` for the
+resolution 6/7/8 comparison this was decided against.
 
 ### Reliability rule
 
-**A zone-quarter needs at least 30 measurements (tests) to be classified at all.** Below that,
-we say **"insufficient public evidence"** — never a low score, because we genuinely don't know.
-Today (2026Q2): 1,815 zones have any measurement; **314 clear the 30-test bar**; those 314
-represent 37.6% of the national population.
+**A zone-quarter needs at least `MIN_TESTS_FOR_RELIABLE_EVIDENCE` measurements (tests) to be
+classified at all.** Below that, we say **"insufficient public evidence"** — never a low score,
+because we genuinely don't know. *Note: this constant is currently set to `1` in the code, not
+the `30` this rule was designed around — see `docs/validation_summary.md`.* Today (2026Q2, H3
+resolution 6): 671 zones have any measurement; at the current `tests >= 1` setting all 671 clear
+the bar (93.5% of national population); at the original `tests >= 30` bar, 155 would clear it
+(67.1% of national population).
 
 ### Experience Index
 
@@ -40,13 +44,13 @@ road/POI density. Never compared blindly against the whole country.
 ### Peer Gap
 
 How far a zone's Experience Index sits below (or above) its peer group's median, in the same
-quarter. 2026Q2 peer medians: commercial/urban-core 43.9, low-density residential 43.4,
-industrial 30.4, rural/edge 17.7 — real, meaningful differences.
+quarter. 2026Q2 peer medians (H3 resolution 6): commercial/urban-core 47.8, low-density
+residential 45.0, industrial 40.4, rural/edge 34.4 — real, meaningful differences.
 
 ### Trend / deterioration
 
 A zone is flagged as deteriorating only after 3 consecutive quarters of falling behind its
-peers — not one bad quarter. 39 zones hit this pattern at some point in the last 2 years; 10
+peers — not one bad quarter. 84 zones hit this pattern at some point in the last 2 years; 22
 are currently in it.
 
 ### ML anomaly detection
@@ -74,8 +78,8 @@ impact, not just technical severity.
 Combines four things — peer gap, ML anomaly, deterioration, and population — into one 0–100
 ranking of where to investigate first. Confidence is *multiplied* in, not added, so a
 low-evidence zone can never rank as high priority no matter how bad it looks. We tested this by
-nudging the weights ±15%: the ranking barely moved (Spearman correlation 0.996) — it's not a
-fragile, arbitrary choice.
+nudging the weights ±15%: the ranking barely moved (worst-case Spearman correlation 0.998) —
+it's not a fragile, arbitrary choice.
 
 ### Limitation
 

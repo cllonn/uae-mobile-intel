@@ -1,10 +1,10 @@
 {
-  "chosen_resolution": 7,
+  "chosen_resolution": 6,
   "latest_quarter_used": "2026Q2",
-  "zones_latest_quarter": 1815,
-  "zones_all_quarters": 3400,
-  "median_tests_per_zone": 4.0,
-  "share_zones_tests_ge_30": 0.173,
-  "qoq_download_change_iqr": 1.036,
-  "justification": "Resolution 7 reproduces the brief's own cited density figures (median 4 tests/zone, ~83% of zones below 30 tests) on independently UAE-clipped data, yields a 'few hundred well-measured zones nationally' evidence pool consistent with the brief's expectation, and has quarter-over-quarter score stability close to resolution 6 while resolving far more granular zones for drill-down. Resolution 8 is confirmed too sparse to aggregate (mean 1.4 tiles/zone) and is reserved for display only."
+  "zones_latest_quarter": 671,
+  "zones_all_quarters": 1074,
+  "median_tests_per_zone": 5.0,
+  "share_zones_tests_ge_30": 0.231,
+  "qoq_download_change_iqr": 0.982,
+  "justification": "Resolution 6 is adopted as the project's authoritative H3 resolution by direct project decision, not because it won this notebook's own comparison criteria outright. It is the most stable of the three candidates on quarter-over-quarter download change (IQR 0.982 vs. 1.036 at res 7 and 1.348 at res 8), and puts a larger share of zones over the >=30-test evidence bar (23.1% vs. 17.3% at res 7). It does not reproduce the brief's own cited density figures (median 4 tests/zone, ~83% of zones below 30 tests) as closely as resolution 7 does, and resolves into fewer, larger zones nationally (671 vs. 1,815 at res 7) -- accepted tradeoffs of this decision. Resolution 8 remains confirmed too sparse to aggregate (mean 1.4 tiles/zone, 65% single-tile zones) and stays reserved for display only."
 }

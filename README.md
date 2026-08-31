@@ -46,10 +46,10 @@ own raw inputs if they're not already present, so running a notebook end to end 
 `data/raw/` from nothing. Processed outputs (small) live under `data/processed/` and **are**
 committed.
 
-**Geographic unit:** H3 resolution 7, chosen empirically in
-[`04_h3_resolution_choice.ipynb`](notebooks/04_h3_resolution_choice.ipynb) against measurement
-density and quarter-over-quarter stability — see that notebook for the resolution 6/7/8
-comparison. Persisted at `data/processed/h3_resolution.json`.
+**Geographic unit:** H3 resolution 6 (project decision — see
+[`04_h3_resolution_choice.ipynb`](notebooks/04_h3_resolution_choice.ipynb) for the resolution
+6/7/8 comparison and the tradeoffs this decision accepts). Persisted at
+`data/processed/h3_resolution.json`.
 
 ## Pipeline architecture
 
@@ -85,19 +85,35 @@ Peer Gap + Trend + ML anomaly   (src/trends.py, src/anomaly_detection.py)
 
 ## The evidence threshold (read this first)
 
-**A zone-quarter needs `tests >= 30` to be classified at all** —
-`MIN_TESTS_FOR_RELIABLE_EVIDENCE = 30` in `src/compute_scores.py`, the single authoritative gate
-every other module reads (`insufficient_evidence`), never re-derives. Below 30 tests, a zone
-gets **no Experience Index, no Priority Score, nothing** — the honest output is "insufficient
-public evidence," never a low score. Confidence Score is a separate concept: it still
-differentiates strength of evidence *among* zones that clear this bar (30 tests scores lower
-confidence than 500 tests) — it doesn't decide whether a zone is classified.
+**A zone-quarter needs `tests >= MIN_TESTS_FOR_RELIABLE_EVIDENCE` to be classified at all** — the
+single authoritative gate in `src/compute_scores.py` every other module reads
+(`insufficient_evidence`), never re-derives. Below that bar, a zone gets **no Experience Index,
+no Priority Score, nothing** — the honest output is "insufficient public evidence," never a low
+score. Confidence Score is a separate concept: it still differentiates strength of evidence
+*among* zones that clear this bar — it doesn't decide whether a zone is classified.
 
-2026Q2 headline numbers under this rule: 1,815 zones measured, **314 classified (17.3%)**,
-37.6% of national population represented, 32 zones flagged for investigation. Across all 8
-quarters: 2,085 of 13,597 zone-quarters classified (84.7% insufficient evidence) — the brief's
-own point that a "few hundred well-measured zones, not thousands" is the honest scale of this
-dataset, confirmed directly on this data.
+> **Current code state:** `MIN_TESTS_FOR_RELIABLE_EVIDENCE = 1` in `src/compute_scores.py` as of
+> this revision (not the `30` this section previously described). That value was already changed,
+> uncommitted, in the working tree before the H3 resolution 6 migration below — it was
+> deliberately left as-is during that migration (out of scope for a resolution change) rather
+> than reverted. **If `30` was the intended value, this needs a separate, explicit fix** — see
+> `docs/validation_summary.md` for the numbers at both thresholds.
+
+2026Q2 headline numbers at H3 resolution 6, under the *current* `tests >= 1` rule: 671 zones
+measured, **671 classified (100%)**, 93.5% of national population represented, 68 zones flagged
+for investigation. Across all 8 quarters: 5,011 of 5,011 zone-quarters classified (0%
+insufficient evidence).
+
+For reference, the *same resolution-6 data* re-scored at the historical `tests >= 30` bar gives
+155 classified (23.1%), 67.1% population represented, 16 priority zones — the number that's
+directly comparable to the old resolution-7 baseline below, since it isolates the resolution
+change from the threshold change.
+
+**Resolution 7 → 6, holding the evidence threshold fixed at `>= 30`** (isolates the effect of
+the H3 resolution change alone): 1,815 → 671 zones measured, 314 → 155 classified (17.3% → 23.1%
+of measured zones), 37.6% → 67.1% of national population represented, 32 → 16 priority zones
+flagged. Fewer, larger zones pool more tests each, so a bigger *share* clears the bar even though
+the *count* of zones nationally drops.
 
 ## Deterministic scores
 
@@ -107,15 +123,16 @@ latency, each min-max normalized. **Confidence Score** — 0–100: 50% log-scal
 Index minus its peer group's median, in the *same quarter*, computed from classified zones only.
 Peer groups (`09_peer_group_classifier.ipynb`, KMeans k=4 on density features, never OSM
 land-use tag): commercial/urban-core, low-density residential, industrial, rural/edge. 2026Q2
-peer medians: commercial/urban-core 43.9, low-density residential 43.4, industrial 30.4,
-rural/edge 17.7 — real, meaningful spread.
+peer medians (H3 resolution 6): commercial/urban-core 47.8, low-density residential 45.0,
+industrial 40.4, rural/edge 34.4 — real, meaningful spread.
 
 ## Trend, ML anomaly detection, and Priority
 
 - **Trend** (`src/trends.py`) — deterioration relative to peer-group trend (tracks `peer_gap`
-  quarter to quarter, never raw Mbps), flagged only after 3 consecutive declining quarters. 39
-  unique zones hit this pattern at some point across the 8-quarter window; 10 are currently
-  deteriorating as of 2026Q2.
+  quarter to quarter, never raw Mbps), flagged only after 3 consecutive declining quarters. 84
+  unique zones hit this pattern at some point across the 8-quarter window; 22 are currently
+  deteriorating as of 2026Q2 (H3 resolution 6, current `tests >= 1` threshold — see "The evidence
+  threshold" above).
 - **ML anomaly detection** (`src/anomaly_detection.py`) — two Isolation Forest models (Peer Gap:
   vs. peer-group z-scores this quarter; Temporal Anomaly: vs. the zone's own history), each
   compared against a deterministic bottom-decile-download baseline. **T2 result, reported
@@ -127,8 +144,8 @@ rural/edge 17.7 — real, meaningful spread.
 - **Priority** (`src/priority.py`) — `Priority = 0.35·PeerGap + 0.20·MLAnomaly +
   0.20·Deterioration + 0.25·Population`, **multiplied** by `confidence/100` (not added as a
   fifth factor), so a low-confidence zone structurally cannot reach a high Priority Score. Top
-  10% per quarter flagged — 32 of 314 in 2026Q2. Sensitivity-tested (T5): ±15% weight
-  perturbation, worst-case Spearman ρ=0.996 — not fragile.
+  10% per quarter flagged — 68 of 671 in 2026Q2. Sensitivity-tested (T5): ±15% weight
+  perturbation, worst-case Spearman ρ=0.998 — not fragile.
 - `src/run_pipeline.py` chains all of the above into `data/processed/zone_priority.parquet`.
   Re-run whenever an upstream input changes: `python -m src.run_pipeline`.
 
