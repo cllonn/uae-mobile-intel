@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.compute_scores import add_effective_latency, add_quarters_observed, confidence_score
+from src.compute_scores import add_effective_latency, add_quarters_observed, confidence_score, compute_evidence_tier
 
 ZONE_PRIORITY_PATH = Path("data/processed/zone_priority.parquet")
 
@@ -31,13 +31,14 @@ def test_busy_vs_sparse_case_are_labeled_differently():
     busy = add_quarters_observed(add_effective_latency(_make_case(500, 100)))
     sparse = add_quarters_observed(add_effective_latency(_make_case(2, 1)))
 
-    busy_score, busy_insufficient = confidence_score(busy)
-    sparse_score, sparse_insufficient = confidence_score(sparse)
+    busy_score, sparse_score = confidence_score(busy), confidence_score(sparse)
+    busy_tier, sparse_tier = compute_evidence_tier(busy), compute_evidence_tier(sparse)
 
-    assert not bool(busy_insufficient.iloc[0]), "500 tests/100 devices must be classified, not insufficient"
-    assert bool(sparse_insufficient.iloc[0]), "2 tests/1 device must be labeled insufficient evidence"
+    assert busy_tier.iloc[0] != "insufficient", "500 tests/100 devices must be classified, not insufficient"
+    assert sparse_tier.iloc[0] == "insufficient", "2 tests/1 device must be labeled insufficient evidence"
     assert busy_score.iloc[0] > sparse_score.iloc[0], "busy case must score higher confidence"
-    print(f"T4 constructed case: busy confidence={busy_score.iloc[0]}, sparse confidence={sparse_score.iloc[0]} (insufficient=True)")
+    print(f"T4 constructed case: busy confidence={busy_score.iloc[0]} (tier={busy_tier.iloc[0]}), "
+          f"sparse confidence={sparse_score.iloc[0]} (tier={sparse_tier.iloc[0]})")
 
 
 def test_all_real_2test_1device_zones_are_insufficient():

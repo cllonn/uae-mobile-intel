@@ -135,6 +135,7 @@ _TOOLS = {
     "get_zone_peer_comparison": ct.get_zone_peer_comparison,
     "get_zone_trend": ct.get_zone_trend,
     "get_top_priority_zones": ct.get_top_priority_zones,
+    "get_priority_zones": ct.get_priority_zones,
     "get_weakest_zones": ct.get_weakest_zones,
     "get_deteriorating_zones": ct.get_deteriorating_zones,
     "get_anomalous_zones": ct.get_anomalous_zones,
@@ -142,6 +143,11 @@ _TOOLS = {
     "get_coverage_summary": ct.get_coverage_summary,
     "get_methodology": ct.get_methodology,
 }
+# get_priority_zones is deliberately NOT reachable from route() -- "which N areas first" (a
+# canonical question, caller-chosen N) and "every zone actually flagged" (a fixed, data-
+# determined set, used only by generate_all_priority_zone_briefs below) are different
+# questions. It's registered in _TOOLS so answer_question() can still dispatch to it directly
+# if a caller passes the tool name explicitly.
 
 
 # ---------------------------------------------------------------------------
@@ -188,14 +194,15 @@ def _template_narrate(question: str, tool_name: str, tool_result) -> str:
     """Deterministic fallback narrator -- no LLM call, plain string formatting over the same
     JSON an LLM would receive. Exists so the full pipeline is demoable and testable with zero
     external dependencies; swap in `_llm_narrate` the moment a key is available."""
-    if tool_name in ("get_top_priority_zones", "get_weakest_zones", "get_high_population_weak_zones",
-                     "get_deteriorating_zones", "get_anomalous_zones"):
+    if tool_name in ("get_top_priority_zones", "get_priority_zones", "get_weakest_zones",
+                     "get_high_population_weak_zones", "get_deteriorating_zones", "get_anomalous_zones"):
         if not tool_result:
             return "No zones matched this query at the requested evidence threshold."
         lines = [
             f"{i+1}. Zone {z['zone_id'][-6:]} ({z['emirate']}, {z['peer_group']}) -- "
             f"Experience {z.get('experience_index')}, Confidence {z.get('confidence_score')}, "
-            f"Priority {z.get('priority_score')}"
+            + (f"Priority {z['priority_score']}" if z.get("evidence_tier") == "full"
+               else "not shortlist-eligible (10-29 tests, low-confidence evidence)")
             for i, z in enumerate(tool_result[:10])
         ]
         return f"Found {len(tool_result)} matching zone(s):\n" + "\n".join(lines)
@@ -206,15 +213,29 @@ def _template_narrate(question: str, tool_name: str, tool_result) -> str:
                     f"({tool_result['tests']} tests, {tool_result['devices']} devices this quarter.)")
         if tool_result.get("error"):
             return f"No data found: {tool_result['error']}."
-        return (
+
+        base = (
             f"Zone {tool_result['zone_id'][-6:]} ({tool_result['emirate']}, {tool_result['peer_group']}), "
             f"{tool_result['quarter']}: Experience Index {tool_result['experience_index']} vs. peer median "
             f"{tool_result['peer_group_median_experience']} ({tool_result['peer_gap']:+.1f} pts). "
             f"Confidence {tool_result['confidence_score']}/100 from {tool_result['tests']} tests / "
-            f"{tool_result['devices']} devices across {tool_result['quarters_observed']}/8 quarters. "
-            f"Priority Score {tool_result['priority_score']}"
+            f"{tool_result['devices']} devices across {tool_result['quarters_observed']}/8 quarters."
+        )
+        # 'low' evidence tier (10-29 tests): a real Experience Index exists above, but
+        # src/priority.py never computes a Priority Score for this tier at all -- no Priority
+        # Score line to show, and no factor breakdown to invent one from.
+        if tool_result.get("evidence_tier") != "full":
+            return (
+                f"{base} This zone has low-confidence evidence (10-29 tests) -- shown, but "
+                f"not eligible for the Priority shortlist; it is informative, not a safe "
+                f"recommendation. This reflects public measurement patterns only; it cannot "
+                f"identify an operator-specific cause."
+            )
+        high_factors = [k for k, v in tool_result["priority_factors"].items() if v == "High"]
+        return (
+            f"{base} Priority Score {tool_result['priority_score']}"
             f"{' (flagged for investigation)' if tool_result['priority_zone'] else ''}, driven mainly by: "
-            + ", ".join(f"{k} = {v}" for k, v in tool_result["priority_factors"].items() if v == "High")
+            + (", ".join(high_factors) if high_factors else "no single dominant factor")
             + ". This reflects public measurement patterns only; it cannot identify an operator-specific cause."
         )
 
@@ -332,20 +353,49 @@ def generate_zone_brief(zone_id: str, quarter: str | None = None) -> dict:
         except Exception as exc:
             pass  # fall through to template
 
+    peer_summary = (
+        f"a public mobile experience of {context['experience_index']}/100, "
+        f"{abs(context['peer_gap']):.1f} points {'below' if context['peer_gap'] < 0 else 'above'} "
+        f"its {context['peer_group']} peer median of {context['peer_group_median_experience']} "
+        f"({context['peer_group_size']} peers)."
+    )
+    confidence_summary = (
+        f"Confidence is {context['confidence_score']}/100, based on {context['tests']} tests from "
+        f"{context['devices']} devices across {context['quarters_observed']}/8 quarters."
+    )
+    # 'low' evidence tier: no Priority Score exists for this zone at all -- generate_zone_brief
+    # can be called on any zone_id, not only ones that came from get_priority_zones, so this
+    # path is real, not hypothetical. Never invent a priority narrative for it.
+    if context.get("evidence_tier") != "full":
+        brief = (
+            f"Zone {zone_id[-6:]} ({context['emirate']}) shows {peer_summary} {confidence_summary} "
+            f"Estimated population exposure is {context['population']:,}. This zone has "
+            f"low-confidence evidence (10-29 tests) and was never eligible for the Priority "
+            f"shortlist -- no Priority Score exists for it; treat this as informative context, "
+            f"not an investigation recommendation. This is public, outside-in measurement data; "
+            f"it cannot identify an operator-specific root cause."
+        )
+        return {"zone_id": zone_id, "brief": brief, "mode": "template", "evidence": context}
+
     high_factors = [k for k, v in context["priority_factors"].items() if v == "High"]
     if len(high_factors) > 1:
         factor_text = ", ".join(high_factors[:-1]) + f" and {high_factors[-1]}"
     else:
         factor_text = high_factors[0] if high_factors else "a combination of moderate factors"
     brief = (
-        f"Zone {zone_id[-6:]} ({context['emirate']}) shows a public mobile experience of "
-        f"{context['experience_index']}/100, {abs(context['peer_gap']):.1f} points "
-        f"{'below' if context['peer_gap'] < 0 else 'above'} its {context['peer_group']} peer "
-        f"median of {context['peer_group_median_experience']} ({context['peer_group_size']} peers). "
-        f"Confidence is {context['confidence_score']}/100, based on {context['tests']} tests from "
-        f"{context['devices']} devices across {context['quarters_observed']}/8 quarters. "
+        f"Zone {zone_id[-6:]} ({context['emirate']}) shows {peer_summary} {confidence_summary} "
         f"Estimated population exposure is {context['population']:,}. "
         f"It received a Priority Score of {context['priority_score']}, driven mainly by {factor_text}. "
         f"This is public, outside-in measurement data; it cannot identify an operator-specific root cause."
     )
     return {"zone_id": zone_id, "brief": brief, "mode": "template", "evidence": context}
+
+
+def generate_all_priority_zone_briefs(quarter: str | None = None, emirate: str | None = None) -> list[dict]:
+    """The mandatory "AI zone brief for every Priority zone" capability -- iterates
+    `ct.get_priority_zones()` (the real, data-determined shortlist, not a caller-chosen top N)
+    and calls `generate_zone_brief` once per zone. No new grounding logic here: correctness is
+    entirely inherited from `get_priority_zones` (evidence gating) and `generate_zone_brief`
+    (narration contract) above."""
+    zones = ct.get_priority_zones(quarter=quarter, emirate=emirate)
+    return [generate_zone_brief(z["zone_id"], z["quarter"]) for z in zones]

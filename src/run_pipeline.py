@@ -40,7 +40,7 @@ def main():
     df = add_baseline_bottom_decile(df)
     print(f"Anomaly:  Peer Gap ML flagged {df['peer_gap_ml_anomaly'].sum()}, "
           f"Temporal Anomaly ML flagged {df['temporal_anomaly_ml_flag'].sum()}, "
-          f"baseline (bottom-decile download) flagged {df['baseline_bottom_decile_flag'].sum()}")
+          f"baseline (bottom-decile Experience within peer group) flagged {df['baseline_bottom_decile_flag'].sum()}")
     print(compare_flags_to_baseline(df).to_string(index=False))
 
     df = add_priority(df)

@@ -15,7 +15,41 @@ output of the scores -> trend -> anomaly -> priority pipeline, now carrying the 
 added by `scripts/build_emirate_field.py`) and `population_zones_uae.parquet` (for the
 population-represented KPI, which needs the *full* population universe, not just measured
 zones, as its denominator). Writes `data/processed/uae_dashboard.html`.
+
+Demo-day serving (investigated 2026-09-02, after "VS Code preview shows the current build,
+Chrome shows something older/different"): this page has ZERO fetch()/XHR/service-worker calls
+anywhere -- confirmed by grep across the whole repo -- every number is embedded directly into
+the `<script>` block as a JS const at build time (see `render_html` below). So the original
+mentor guidance about `fetch()` being blocked or mishandled under `file://` does not apply
+here; there is nothing to fetch. The actual, confirmed cause is ordinary browser caching of the
+HTML DOCUMENT ITSELF by URL: rebuild the file, reopen the *same* URL/path in an already-used
+browser, and the browser can serve its cached copy of the old build instead of re-reading the
+file from disk -- especially likely opened as `file://` (no real HTTP cache-validation
+handshake at all) or revisited within a browser tab that was never told to reload. VS Code's
+preview doesn't hit this because its webview re-reads the file fresh on every open.
+
+The fix has three parts, all below: (1) always serve over real HTTP
+(`python -m src.serve_dashboard`, from the repo root, then open
+`http://localhost:8000/data/processed/uae_dashboard.html`) so there is at least a real
+Last-Modified-based cache-validation handshake, never `file://`; (2) cache-bust the page's own
+URL with a `?v=<build id>` query string every time you reopen it after a rebuild -- `main()`
+below prints the exact ready-to-paste URL; (3) a visible build stamp (footer + browser console)
+so a stale load is obvious at a glance rather than silently showing old numbers. No fetch/JSON
+loading architecture was added for the map/scores -- the page didn't need one for those and
+still doesn't; every number on the map is still embedded at build time, unchanged.
+
+AI Copilot panel (added 2026-09-02): this is the one piece of the page that genuinely cannot be
+precomputed the way the map is -- a free-text or zone-scoped question chosen at runtime needs
+the real `src/copilot.py` to run, which is Python. The panel's JS therefore does make one real
+`fetch('/api/copilot', ...)` call per question -- see `src/serve_dashboard.py`, a small
+stdlib-only server that serves this same static file AND that one JSON route. Nothing else
+about the page's "no fetch" design changed; this is the sole, necessary exception, and the
+panel does no routing/scoring/narration of its own -- it only displays what that endpoint
+returns. `python -m src.serve_dashboard` replaces the plain `python -m http.server 8000` from
+here on; it serves every static file exactly the same way, so the rest of this section's advice
+(cache-busting, incognito testing) is unchanged.
 """
+import datetime as dt
 import json
 import math
 from pathlib import Path
@@ -103,6 +137,10 @@ def _num(v):
     return None if pd.isna(v) else round(float(v), 1)
 
 
+def _band(v):
+    return None if pd.isna(v) else str(v)
+
+
 def build_zone_data(priority_path: Path, population_path: Path):
     """Per-classified-zone data for *every* quarter (not just the latest -- the quarter
     selector needs all 8), plus per-quarter KPIs and the 8-quarter Experience Index history
@@ -125,8 +163,12 @@ def build_zone_data(priority_path: Path, population_path: Path):
         return {
             "emirate": row["emirate"],
             "peer_group": row["peer_group"],
+            "evidence_tier": row["evidence_tier"],  # 'low' or 'full' here -- 'insufficient' zones never reach this dict at all
             "experience_index": _num(row["experience_index"]),
             "confidence_score": _num(row["confidence_score"]),
+            # priority_score/priority_zone/bands are only ever non-null for 'full' tier rows --
+            # src/priority.py leaves them NaN/False for 'low' tier, "not eligible," never a
+            # fabricated low score. _num/_band pass that through as null for the JS side.
             "priority_score": _num(row["priority_score"]),
             "priority_zone": bool(row["priority_zone"]),
             "download_mbps": _num(row["download_mbps"]),
@@ -144,10 +186,10 @@ def build_zone_data(priority_path: Path, population_path: Path):
             "peer_gap_ml_anomaly": bool(row["peer_gap_ml_anomaly"]),
             "temporal_anomaly_ml_flag": bool(row["temporal_anomaly_ml_flag"]),
             "bands": {
-                "peer_gap": str(row["peer_gap_band"]),
-                "ml_anomaly": str(row["ml_anomaly_band"]),
-                "deterioration": str(row["deterioration_band"]),
-                "population": str(row["population_band"]),
+                "peer_gap": _band(row["peer_gap_band"]),
+                "temporal_anomaly": _band(row["temporal_anomaly_band"]),
+                "deterioration": _band(row["deterioration_band"]),
+                "population": _band(row["population_band"]),
             },
             "lat": round(lat, 4),
             "lon": round(lon, 4),
@@ -163,8 +205,13 @@ def build_zone_data(priority_path: Path, population_path: Path):
             continue
         records = {row["h3_cell"]: zone_record(row) for _, row in classified.iterrows()}
         zones_by_quarter[quarter] = records
+        # Shortlist candidates are 'full' tier only -- pandas already sorts NaN priority_score
+        # (the 'low' tier rows) last regardless of ascending/descending, but filtering
+        # explicitly here means a sparse quarter/emirate with under 5 full-tier zones can never
+        # backfill the national top-5 with a shortlist-ineligible zone.
+        shortlist_eligible = classified[classified["evidence_tier"] == "full"]
         top5_by_quarter[quarter] = (
-            classified.sort_values("priority_score", ascending=False).head(5)["h3_cell"].tolist()
+            shortlist_eligible.sort_values("priority_score", ascending=False).head(5)["h3_cell"].tolist()
         )
         prev_classified = classified_all[classified_all["quarter"] == QUARTER_ORDER[i - 1]] if i > 0 else None
         kpis_by_quarter[quarter] = {
@@ -203,11 +250,17 @@ def build_zone_data(priority_path: Path, population_path: Path):
 
 
 def render_html(hexagons, width, height, labels, zones_by_quarter, top5_by_quarter,
-                 kpis_by_quarter, domains, population_by_emirate) -> str:
+                 kpis_by_quarter, domains, population_by_emirate,
+                 build_id, data_path, data_mtime) -> str:
     """Assembles the full self-contained HTML page: CSS for layout/theme, embedded JSON for
     the hex grid + per-quarter zone data, and vanilla JS for layer/quarter/emirate switching
     and zone drill-down. No chat/copilot UI -- that's a separate capability, not part of this
-    map."""
+    map.
+
+    `build_id`/`data_path`/`data_mtime` exist purely for demo-day freshness verification (see
+    "Demo-day serving" in the module docstring) -- shown in the footer and logged to the
+    console on load, so "is this the current build?" is answerable at a glance instead of by
+    guessing from what's on screen."""
     hex_paths = "\n".join(
         f'<path id="hex-{h["id"]}" class="hex" d="{h["d"]}" onclick="selectZone(\'{h["id"]}\')"></path>'
         for h in hexagons
@@ -225,6 +278,13 @@ def render_html(hexagons, width, height, labels, zones_by_quarter, top5_by_quart
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<!-- Defense-in-depth only -- meta cache directives are weakly/inconsistently honored by
+     browsers for top-level navigation. The real cache-busting mechanism is the ?v= query
+     param on the URL (see "Demo-day serving" in src/build_dashboard.py) and serving over
+     python -m http.server rather than opening this file directly. -->
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>UAE Mobile Network Experience Intelligence</title>
 <style>
 {_CSS}
@@ -277,6 +337,35 @@ def render_html(hexagons, width, height, labels, zones_by_quarter, top5_by_quart
       {label_svg}
       </g>
     </svg>
+
+    <div class="copilot-panel collapsed" id="copilot-panel">
+      <div class="copilot-header" onclick="toggleCopilot()">
+        <div>
+          <div class="copilot-title">AI Copilot</div>
+          <div class="copilot-subtitle">Public outside-in mobile data &middot; not e&amp; network data</div>
+        </div>
+        <span class="copilot-caret" id="copilot-caret">&#9662;</span>
+      </div>
+      <div class="copilot-body" id="copilot-body">
+        <div class="copilot-messages" id="copilot-messages">
+          <div class="copilot-msg assistant">Ask about UAE public mobile experience &mdash; weakest zones,
+            priorities, deterioration, anomalies, or the zone currently selected on the map. Every number in
+            an answer comes from the computed pipeline, never invented.</div>
+        </div>
+        <div class="copilot-suggestions">
+          <button onclick="askCopilot('Which 5 areas should we investigate first?')">Which 5 areas should we investigate first?</button>
+          <button onclick="askCopilot('Where is experience weakest?')">Where is experience weakest?</button>
+          <button onclick="askCopilot('Which areas are deteriorating?')">Which areas are deteriorating?</button>
+          <button onclick="askCopilot('Why is this zone high priority?')">Why is this zone high priority?</button>
+        </div>
+        <div class="copilot-input-row">
+          <input type="text" id="copilot-input" placeholder="Ask a question&hellip;"
+                 onkeydown="if(event.key==='Enter'){{sendCopilotQuestion();}}">
+          <button id="copilot-send-btn" onclick="sendCopilotQuestion()">Send</button>
+        </div>
+      </div>
+    </div>
+
     <div class="legend" id="legend"></div>
   </div>
 
@@ -294,6 +383,7 @@ def render_html(hexagons, width, height, labels, zones_by_quarter, top5_by_quart
   Ookla Speedtest Open Data, aggregated from S3 parquet/performance/type=mobile,
   2024 Q3 &ndash; 2026 Q2 (CC BY-NC-SA 4.0, non-commercial research/education use only) &middot;
   H3 resolution {MAP_H3_RESOLUTION}
+  <span id="build-stamp" style="float:right"></span>
 </footer>
 
 <script>
@@ -303,6 +393,26 @@ const TOP5_BY_QUARTER = {json.dumps(top5_by_quarter)};
 const KPIS_BY_QUARTER = {json.dumps(kpis_by_quarter)};
 const DOMAINS = {json.dumps(domains)};
 const POPULATION_BY_EMIRATE = {json.dumps(population_by_emirate)};
+const BUILD_ID = {json.dumps(build_id)};
+const DATA_PATH = {json.dumps(data_path)};
+const DATA_MTIME = {json.dumps(data_mtime)};
+
+// Demo-day freshness check (mentor-flagged root cause, 2026-09-01): "VS Code preview shows
+// current, external browser shows stale" was never a fetch/CORS problem -- this page has no
+// fetch() calls, everything above is embedded at build time. The real cause is the browser
+// caching the HTML document itself by URL. Printing + displaying the build stamp makes a
+// stale load immediately obvious instead of silently showing old numbers.
+console.log(`UAE Mobile Intelligence dashboard -- build ${{BUILD_ID}} -- data from ${{DATA_PATH}} (modified ${{DATA_MTIME}})`);
+document.getElementById('build-stamp').textContent = `build ${{BUILD_ID}}`;
+
+// This page has never registered a service worker (no offline/PWA code anywhere in this
+// repo) -- but the browser's registration for a given origin (e.g. localhost:8000) persists
+// across unrelated pages/projects served from that same origin/port in the past, and a
+// lingering one from some other local project could silently intercept and cache this page's
+// requests. Unregistering here is a no-op when none exists, and cheap insurance when one does.
+if ('serviceWorker' in navigator) {{
+  navigator.serviceWorker.getRegistrations().then(regs => regs.forEach(reg => reg.unregister()));
+}}
 {_JS}
 </script>
 
@@ -350,6 +460,12 @@ main { display: flex; height: calc(100vh - 190px); min-height: 520px; }
    either direction). Re-appended to the end of its parent in JS on selection so the enlarged
    hex draws on top of (not clipped under) its neighbors. */
 .hex.selected { stroke: var(--accent); stroke-width: 2.2; transform-box: fill-box; transform-origin: center; transform: scale(1.04); }
+/* Low-confidence tier (10-29 tests): Experience Index is shown at full opacity/color like any
+   other scored zone -- the mentor's rule is that it must stay informative on the map, not be
+   visually suppressed -- but a dashed border marks it as evidence you can look at, not act on
+   (not eligible for the Priority shortlist). Applied dynamically in JS since a zone's tier can
+   differ by quarter, unlike the hex's static geometry. */
+.hex.low-tier { stroke-dasharray: 2.4,1.8; }
 .place-label { font-size: 7px; fill: #9a9aa2; letter-spacing: 0.5px; text-transform: uppercase; pointer-events: none; }
 .legend { position: absolute; left: 14px; bottom: 14px; background: rgba(255,255,255,0.92); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 10.5px; width: 190px; }
 .legend-title { font-weight: 600; text-transform: uppercase; font-size: 9.5px; color: var(--text-dim); margin-bottom: 5px; }
@@ -394,6 +510,39 @@ main { display: flex; height: calc(100vh - 190px); min-height: 520px; }
 .band.Low { background: #eef7ee; color: #2e7d32; }
 .insufficient-msg { background: var(--bg); border-radius: 8px; padding: 14px; font-size: 12.5px; color: var(--text-dim); line-height: 1.5; }
 footer { padding: 8px 20px; font-size: 10px; color: var(--text-dim); background: var(--panel); border-top: 1px solid var(--border); }
+
+/* AI Copilot -- an overlay card pinned to the map's top-left corner (the same absolute-inside-
+   .map-pane trick `.legend` already uses, just the opposite corner -- so it sits directly under
+   the "Scored zones" KPI tile above it, and needs no change to `main`'s existing flex layout).
+   Collapsible: the header is the whole toggle target, `.collapsed` hides everything below it via
+   `.copilot-body`'s display:none, so by default it's just a slim title bar over the map corner. */
+.copilot-panel { position: absolute; top: 14px; left: 14px; z-index: 20; width: 320px; max-width: calc(100% - 28px); max-height: min(380px, calc(100% - 190px)); background: rgba(255,255,255,0.97); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.16); display: flex; flex-direction: column; overflow: hidden; }
+.copilot-header { padding: 9px 11px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; flex-shrink: 0; }
+.copilot-panel:not(.collapsed) .copilot-header { border-bottom: 1px solid var(--border); }
+.copilot-title { font-size: 12px; font-weight: 700; }
+.copilot-subtitle { font-size: 8.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.3px; margin-top: 2px; }
+.copilot-caret { font-size: 11px; color: var(--text-dim); transition: transform 0.15s; flex-shrink: 0; margin-left: 8px; }
+.copilot-panel:not(.collapsed) .copilot-caret { transform: rotate(180deg); }
+.copilot-panel.collapsed .copilot-body { display: none; }
+.copilot-body { display: flex; flex-direction: column; min-height: 0; }
+.copilot-messages { flex: 1; min-height: 100px; overflow-y: auto; padding: 10px 11px; display: flex; flex-direction: column; gap: 8px; }
+.copilot-msg { font-size: 12px; line-height: 1.4; max-width: 92%; padding: 7px 9px; border-radius: 9px; white-space: pre-wrap; }
+.copilot-msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 3px; }
+.copilot-msg.assistant { align-self: flex-start; background: var(--bg); color: var(--text); border-bottom-left-radius: 3px; }
+.copilot-msg.error { align-self: flex-start; background: #fdeeee; color: var(--accent-dark); }
+.copilot-zone-chips { display: flex; flex-wrap: wrap; gap: 5px; align-self: flex-start; max-width: 92%; }
+.copilot-zone-chip { font-size: 10px; border: 1px solid var(--border); background: var(--panel); border-radius: 8px; padding: 3px 8px; cursor: pointer; color: var(--text); font-family: inherit; }
+.copilot-zone-chip:hover { border-color: var(--accent); color: var(--accent-dark); }
+.copilot-typing { font-size: 10.5px; color: var(--text-dim); font-style: italic; align-self: flex-start; }
+.copilot-suggestions { display: flex; flex-wrap: wrap; gap: 4px; padding: 7px 11px; border-top: 1px solid var(--border); flex-shrink: 0; }
+.copilot-suggestions button { font-size: 10px; border: 1px solid var(--border); background: var(--bg); border-radius: 11px; padding: 3px 8px; cursor: pointer; color: var(--text-dim); font-family: inherit; }
+.copilot-suggestions button:hover { border-color: var(--accent); color: var(--accent-dark); }
+.copilot-input-row { display: flex; gap: 6px; padding: 9px 11px; border-top: 1px solid var(--border); flex-shrink: 0; }
+.copilot-input-row input { flex: 1; font-size: 12px; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-family: inherit; min-width: 0; }
+.copilot-input-row input:focus { outline: 1.5px solid var(--accent); }
+.copilot-input-row button { font-size: 11.5px; font-weight: 700; padding: 6px 14px; border-radius: 6px; border: none; background: var(--accent); color: #fff; cursor: pointer; font-family: inherit; flex-shrink: 0; }
+.copilot-input-row button:hover { background: var(--accent-dark); }
+.copilot-input-row button:disabled { background: var(--border); color: var(--text-dim); cursor: default; }
 """
 
 
@@ -464,6 +613,7 @@ function renderLayer() {
     const z = zones[id];
     if (!z) {
       el.style.fill = '#e3e3e6'; // no record for this h3_cell in this quarter -- never inherit an old one
+      el.classList.remove('low-tier');
       return;
     }
     const inFilter = !filterActive || z.emirate === currentEmirate;
@@ -471,6 +621,10 @@ function renderLayer() {
     // hex (never a faded version of their real color) -- an emirate filter must mean "no
     // other emirate's analytical value is shown," not "shown a little less."
     el.style.fill = inFilter ? (colorFor(z, currentLayer) || '#e3e3e6') : '#e3e3e6';
+    // Dashed border for 'low' evidence tier (10-29 tests) -- shown, not suppressed, but visibly
+    // marked as not shortlist-safe. Only when in-filter, so an out-of-filter zone reads as
+    // plain grey like any other hidden zone, not a dashed grey that implies it's still "there."
+    el.classList.toggle('low-tier', inFilter && z.evidence_tier === 'low');
   });
   renderLegend(cfg);
 }
@@ -487,6 +641,7 @@ function renderLegend(cfg) {
     <div class="legend-scale"><span>${lo}</span><span>${hi}</span></div>
     <div class="legend-scale" style="margin-top:4px">${cfg.hint}</div>
     <div class="legend-grey"><div class="legend-grey-swatch"></div>insufficient public evidence &mdash; not classified</div>
+    <div class="legend-grey" style="margin-top:3px"><div class="legend-grey-swatch" style="background:#fff;border-style:dashed"></div>dashed border: low confidence (10&ndash;29 tests) &mdash; not shortlist-eligible</div>
   `;
 }
 
@@ -643,18 +798,41 @@ function selectZone(id) {
       </div>`;
     return;
   }
+  const isFull = z.evidence_tier === 'full';
+  // 'low' tier (10-29 tests): Experience Index and every raw/derived metric below are real and
+  // shown as normal -- only the Priority Score and its factor breakdown don't exist for this
+  // zone (src/priority.py never computes them for anything but 'full' tier), so this panel
+  // must say that plainly rather than rendering a blank/zero score that looks like a real one.
+  const priorityBlock = isFull ? `
+    <div class="zd-big-numbers">
+      <div class="zd-big"><div class="num">${z.priority_score}</div><div class="lbl">Priority score</div></div>
+      <div class="zd-big"><div class="num">${z.experience_index}</div><div class="lbl">Experience index</div></div>
+    </div>` : `
+    <div class="zd-big-numbers">
+      <div class="zd-big"><div class="num">${z.experience_index}</div><div class="lbl">Experience index</div></div>
+    </div>
+    <div class="insufficient-msg" style="margin-bottom:10px">
+      Low-confidence evidence (10&ndash;29 tests): Experience Index is shown, but this zone is
+      <strong>not eligible for the Priority shortlist</strong> &mdash; informative, not a safe
+      recommendation.
+    </div>`;
+  const factorBlock = isFull ? `
+    <div class="panel-title">Why this priority &mdash; factor contributions</div>
+    ${factorRow('Experience gap vs. peers', z.bands.peer_gap)}
+    ${factorRow('Temporal anomaly (vs. own history)', z.bands.temporal_anomaly)}
+    ${factorRow('Deterioration', z.bands.deterioration)}
+    ${factorRow('Population exposure', z.bands.population)}` : '';
+
   panel.innerHTML = `
     <div class="zd-region">${z.emirate} &middot; H3 ${id} &middot; ${currentQuarter}</div>
     <div class="zd-name">Zone ${shortId(id)}</div>
     <div class="zd-tags">
       <span class="tag">Peer: ${z.peer_group}</span>
+      ${!isFull ? '<span class="tag">Low confidence</span>' : ''}
       ${z.priority_zone ? '<span class="tag priority-tag">Priority zone</span>' : ''}
       ${z.deteriorating ? '<span class="tag">Deteriorating</span>' : ''}
     </div>
-    <div class="zd-big-numbers">
-      <div class="zd-big"><div class="num">${z.priority_score}</div><div class="lbl">Priority score</div></div>
-      <div class="zd-big"><div class="num">${z.experience_index}</div><div class="lbl">Experience index</div></div>
-    </div>
+    ${priorityBlock}
     <div class="lbl" style="font-size:10px;color:var(--text-dim)">
       Peer-group median ${z.peer_median} &middot; ${z.peer_gap >= 0 ? '+' : ''}${z.peer_gap} pts (${z.peer_gap_pct}%)
     </div>
@@ -675,11 +853,7 @@ function selectZone(id) {
       <div class="panel-title" style="margin-bottom:2px">8-quarter Experience Index trend</div>
       ${sparklineSvg(z.sparkline)}
     </div>
-    <div class="panel-title">Why this priority &mdash; factor contributions</div>
-    ${factorRow('Experience gap vs. peers', z.bands.peer_gap)}
-    ${factorRow('ML anomaly strength', z.bands.ml_anomaly)}
-    ${factorRow('Deterioration', z.bands.deterioration)}
-    ${factorRow('Population exposure', z.bands.population)}
+    ${factorBlock}
   `;
 }
 
@@ -694,7 +868,11 @@ function renderPriorityList() {
     ranked = TOP5_BY_QUARTER[currentQuarter] || [];
   } else {
     title.textContent = `${currentQuarter} · top priority zones in ${currentEmirate}`;
+    // 'low' tier zones have no priority_score (null) and can never be shortlist candidates --
+    // filtered out here rather than relying on a null sort landing them last, which JS's
+    // `null - number` arithmetic (null coerces to 0) would NOT reliably do.
     ranked = visibleZoneEntries()
+      .filter(([, z]) => z.evidence_tier === 'full')
       .sort((a, b) => b[1].priority_score - a[1].priority_score)
       .slice(0, 5)
       .map(([id]) => id);
@@ -719,6 +897,124 @@ function renderPriorityList() {
   }).join('');
 }
 
+// ---------------------------------------------------------------------------
+// AI Copilot -- thin client for POST /api/copilot (src/serve_dashboard.py -> the real
+// src/copilot.py). This file never routes a question, never picks a tool, never narrates,
+// and never computes a number -- it only sends {question, zone_id, quarter}, then renders
+// whatever structured JSON comes back. `zone_id` is always the currently `selectedZone` (null
+// if none), so a zone-scoped question ("why is THIS zone high priority") automatically means
+// the zone selected on the map, exactly like the side panel already works; `quarter` is
+// always `currentQuarter`, so the Copilot answers about the same quarter the map is showing.
+// ---------------------------------------------------------------------------
+let copilotBusy = false;
+
+function toggleCopilot() {
+  const panel = document.getElementById('copilot-panel');
+  panel.classList.toggle('collapsed');
+  if (!panel.classList.contains('collapsed')) document.getElementById('copilot-input').focus();
+}
+
+function askCopilot(question) {
+  document.getElementById('copilot-input').value = question;
+  sendCopilotQuestion();
+}
+
+// Zone chips are built directly from the tool's own structured result (never parsed out of
+// the narrated prose, which only ever shows a truncated id like "Zone ffffff") -- a listing
+// tool returns an array of zone dicts, a zone-scoped tool (get_zone_details/get_zone_trend/
+// get_zone_peer_comparison) returns one dict with its own zone_id. Either way, every field
+// shown (id, emirate) is exactly what the backend already computed.
+function copilotZoneChips(toolResult) {
+  let zones = [];
+  if (Array.isArray(toolResult)) {
+    zones = toolResult.filter(z => z && z.zone_id).slice(0, 10);
+  } else if (toolResult && typeof toolResult === 'object' && toolResult.zone_id) {
+    zones = [toolResult];
+  }
+  if (!zones.length) return null;
+  const el = document.createElement('div');
+  el.className = 'copilot-zone-chips';
+  el.innerHTML = zones.map(z => {
+    const label = (z.emirate ? z.emirate + ' &middot; ' : '') + shortId(z.zone_id);
+    return `<button class="copilot-zone-chip" onclick="copilotSelectZone('${z.zone_id}')">${label}</button>`;
+  }).join('');
+  return el;
+}
+
+// Clicking a zone chip reuses the exact same selectZone() the map's own hexagons call --
+// highlights the hex and opens its real evidence in the side panel. No separate "copilot
+// selection" concept, no new map logic.
+function copilotSelectZone(zoneId) {
+  selectZone(zoneId);
+}
+
+function appendCopilotMessage(role, text, toolResult) {
+  const container = document.getElementById('copilot-messages');
+  const wrap = document.createElement('div');
+  wrap.style.display = 'flex';
+  wrap.style.flexDirection = 'column';
+  wrap.style.gap = '5px';
+  wrap.style.alignItems = role === 'user' ? 'flex-end' : 'flex-start';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'copilot-msg ' + (role === 'user' ? 'user' : role === 'error' ? 'error' : 'assistant');
+  bubble.textContent = text;
+  wrap.appendChild(bubble);
+
+  if (role === 'assistant') {
+    const chips = copilotZoneChips(toolResult);
+    if (chips) wrap.appendChild(chips);
+  }
+
+  container.appendChild(wrap);
+  container.scrollTop = container.scrollHeight;
+}
+
+function appendCopilotTyping() {
+  const container = document.getElementById('copilot-messages');
+  const el = document.createElement('div');
+  el.className = 'copilot-typing';
+  el.textContent = 'Copilot is thinking...';
+  container.appendChild(el);
+  container.scrollTop = container.scrollHeight;
+  return el;
+}
+
+async function sendCopilotQuestion() {
+  if (copilotBusy) return;
+  const input = document.getElementById('copilot-input');
+  const question = input.value.trim();
+  if (!question) return;
+  input.value = '';
+
+  appendCopilotMessage('user', question);
+  copilotBusy = true;
+  const sendBtn = document.getElementById('copilot-send-btn');
+  if (sendBtn) sendBtn.disabled = true;
+  const typingEl = appendCopilotTyping();
+
+  try {
+    const res = await fetch('/api/copilot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question, zone_id: selectedZone, quarter: currentQuarter }),
+    });
+    const data = await res.json();
+    typingEl.remove();
+    if (!res.ok) {
+      appendCopilotMessage('error', data.message || `The Copilot could not answer that (${data.error || res.status}).`);
+    } else {
+      appendCopilotMessage('assistant', data.answer, data.tool_result);
+    }
+  } catch (err) {
+    typingEl.remove();
+    appendCopilotMessage('error', 'Could not reach the Copilot backend. Start it with: python -m src.serve_dashboard');
+  } finally {
+    copilotBusy = false;
+    if (sendBtn) sendBtn.disabled = false;
+  }
+}
+
 renderKpis();
 renderPriorityList();
 renderLayer();
@@ -728,23 +1024,39 @@ if (initialTop5.length) selectZone(initialTop5[0]);
 
 
 def main():
+    priority_path = Path("data/processed/zone_priority.parquet")
     all_data_cells = pd.read_parquet(
-        Path("data/processed/zone_priority.parquet"), columns=["h3_cell"]
+        priority_path, columns=["h3_cell"]
     )["h3_cell"].unique().tolist()
     hexagons, project, width, height, labels = build_hex_grid(
         Path("data/raw/boundary/uae_boundary.geojson"), extra_cells=all_data_cells
     )
     zones_by_quarter, top5_by_quarter, kpis_by_quarter, domains, population_by_emirate = build_zone_data(
-        Path("data/processed/zone_priority.parquet"), Path("data/processed/population_zones_uae.parquet")
+        priority_path, Path("data/processed/population_zones_uae.parquet")
     )
+
+    # Demo-day freshness stamp -- see "Demo-day serving" above and render_html's docstring.
+    build_id = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+    data_mtime = dt.datetime.fromtimestamp(
+        priority_path.stat().st_mtime, dt.timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%SZ")
+
     html = render_html(hexagons, width, height, labels, zones_by_quarter, top5_by_quarter,
-                        kpis_by_quarter, domains, population_by_emirate)
+                        kpis_by_quarter, domains, population_by_emirate,
+                        build_id=build_id, data_path=priority_path.as_posix(), data_mtime=data_mtime)
 
     out_path = Path("data/processed/uae_dashboard.html")
     out_path.write_text(html, encoding="utf-8")
     print(f"Saved: {out_path} ({out_path.stat().st_size / 1024:.1f} KB)")
     print(f"Hexagons drawn: {len(hexagons)} | quarters with data: {len(zones_by_quarter)}")
     print(f"Latest quarter classified zones: {kpis_by_quarter[list(kpis_by_quarter)[-1]]['scored_zones']}")
+    print(f"Built {build_id} from {priority_path} (modified {data_mtime})")
+    cache_bust = build_id.replace(" ", "T").replace(":", "-")
+    print(f"\nServe (never open as a file:// double-click) from the repo root -- this also")
+    print(f"powers the AI Copilot panel's POST /api/copilot, plain http.server does not:")
+    print(f"    python -m src.serve_dashboard")
+    print(f"Then open, with a fresh cache-busting query string every time you rebuild:")
+    print(f"    http://localhost:8000/{out_path.as_posix()}?v={cache_bust}")
 
 
 if __name__ == "__main__":

@@ -16,8 +16,11 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.compute_scores import CONFIDENCE_WEIGHTS, EXPERIENCE_WEIGHTS, MIN_TESTS_FOR_RELIABLE_EVIDENCE, TESTS_SATURATION
-from src.priority import PRIORITY_WEIGHTS, PRIORITY_ZONE_FRACTION
+from src.compute_scores import (
+    CONFIDENCE_WEIGHTS, EXPERIENCE_WEIGHTS, MIN_TESTS_FOR_RELIABLE_EVIDENCE,
+    CONFIDENCE_TESTS_CAP, CONFIDENCE_DEVICES_CAP,
+)
+from src.priority import PRIORITY_WEIGHTS, PRIORITY_ZONE_FRACTION, CONFIDENCE_GATE_THRESHOLD
 from src.trends import CONSECUTIVE_DECLINES_REQUIRED
 
 ZONE_PRIORITY_PATH = Path("data/processed/zone_priority.parquet")
@@ -40,10 +43,21 @@ def _num(v):
     return None if pd.isna(v) else (bool(v) if isinstance(v, (bool,)) else round(float(v), 2))
 
 
+def _band(v):
+    """Same null-safety as `_num` but for the Low/Medium/High band strings -- `str(nan)`
+    produces the literal text `'nan'`, which is not a valid band and must never reach the
+    narrator (LLM or template) as if it were one. Used for `priority_factors`, which is real
+    for 'full' evidence-tier zones and null for 'low'/'insufficient' tier zones (no Priority
+    Score was ever computed for them)."""
+    return None if pd.isna(v) else str(v)
+
+
 def _classified(quarter: str | None = None, emirate: str | None = None):
-    """Shared filter every listing tool uses: one quarter (defaults to latest), classified
-    zones only (insufficient-evidence zones are never eligible for a ranking), optionally
-    one emirate. Returns (dataframe, resolved_quarter)."""
+    """Shared filter every listing tool uses: one quarter (defaults to latest), any zone with
+    an Experience Index -- 'low' or 'full' evidence tier (insufficient-evidence zones are
+    never eligible for a listing at all), optionally one emirate. Returns (dataframe,
+    resolved_quarter). NOT the right filter for anything Priority-related -- 'low' tier zones
+    have no Priority Score at all; see `_full_tier` below for that."""
     df = _load()
     quarter = quarter or _latest_quarter()
     sub = df[(df["quarter"] == quarter) & (~df["insufficient_evidence"])]
@@ -52,12 +66,31 @@ def _classified(quarter: str | None = None, emirate: str | None = None):
     return sub, quarter
 
 
+def _full_tier(quarter: str | None = None, emirate: str | None = None):
+    """Shared filter for anything Priority-related: 'full' evidence tier only (tests>=30),
+    the same population `src/priority.py` computes a Priority Score for. A 'low' tier zone
+    (10-29 tests) has a real Experience Index but is explicitly excluded from the Priority
+    shortlist per the brief -- 'unsafe as a recommendation' -- so it must never be returned by
+    a tool whose job is ranking/flagging priority zones. Returns (dataframe, resolved_quarter)."""
+    df = _load()
+    quarter = quarter or _latest_quarter()
+    sub = df[(df["quarter"] == quarter) & (df["evidence_tier"] == "full")]
+    if emirate:
+        sub = sub[sub["emirate"] == emirate]
+    return sub, quarter
+
+
 def _summary_row(row: pd.Series) -> dict:
-    """The compact per-zone shape used by every listing tool."""
+    """The compact per-zone shape used by every listing tool. `evidence_tier` is always
+    included -- 'low' or 'full' here, since these rows are always drawn from `_classified`/
+    `_full_tier` which already exclude 'insufficient' -- so a narrator can tell a real-but-
+    ineligible zone (priority_score null, priority_zone False) apart from a real-and-scored one
+    without guessing from the null alone."""
     return {
         "zone_id": row["h3_cell"],
         "quarter": row["quarter"],
         "emirate": row["emirate"],
+        "evidence_tier": row["evidence_tier"],
         "experience_index": _num(row["experience_index"]),
         "confidence_score": _num(row["confidence_score"]),
         "peer_group": row["peer_group"],
@@ -75,7 +108,13 @@ def _summary_row(row: pd.Series) -> dict:
 
 def get_zone_details(zone_id: str, quarter: str | None = None) -> dict:
     """Everything known about one zone in one quarter. If the zone has no row for that
-    quarter, or has too few tests to classify, says so explicitly rather than guessing."""
+    quarter, or has too few tests to classify, says so explicitly rather than guessing.
+
+    `evidence_tier` is always present when the zone has any evidence at all ('low' or 'full')
+    -- 'low' tier zones (10-29 tests) get a real Experience Index/Confidence Score here but
+    `priority_score`/`priority_zone`/`priority_factors` are `None`/`False`/all-`None`, never a
+    fabricated value: `src/priority.py` never computes a Priority Score for that tier at all.
+    A narrator must read `evidence_tier` before trying to explain a priority ranking."""
     df = _load()
     quarter = quarter or _latest_quarter()
     match = df[(df["h3_cell"] == zone_id) & (df["quarter"] == quarter)]
@@ -85,6 +124,7 @@ def get_zone_details(zone_id: str, quarter: str | None = None) -> dict:
     if bool(row["insufficient_evidence"]):
         return {
             "zone_id": zone_id, "quarter": quarter, "evidence_status": "insufficient_evidence",
+            "evidence_tier": row["evidence_tier"],
             "tests": int(row["tests"]), "devices": int(row["devices"]),
             "message": "Too few public Ookla measurements this quarter to compute a reliable "
                        "score. This is not the same as poor performance -- it means there is "
@@ -93,6 +133,7 @@ def get_zone_details(zone_id: str, quarter: str | None = None) -> dict:
     return {
         "zone_id": zone_id, "quarter": quarter, "emirate": row["emirate"],
         "evidence_status": "scored",
+        "evidence_tier": row["evidence_tier"],
         "experience_index": _num(row["experience_index"]),
         "confidence_score": _num(row["confidence_score"]),
         "peer_group": row["peer_group"],
@@ -110,11 +151,12 @@ def get_zone_details(zone_id: str, quarter: str | None = None) -> dict:
         "temporal_anomaly_ml_flag": bool(row["temporal_anomaly_ml_flag"]),
         "priority_score": _num(row["priority_score"]),
         "priority_zone": bool(row["priority_zone"]),
+        "priority_shortlist_eligible": row["evidence_tier"] == "full",
         "priority_factors": {
-            "peer_gap": str(row["peer_gap_band"]),
-            "ml_anomaly": str(row["ml_anomaly_band"]),
-            "deterioration": str(row["deterioration_band"]),
-            "population": str(row["population_band"]),
+            "peer_gap": _band(row["peer_gap_band"]),
+            "temporal_anomaly": _band(row["temporal_anomaly_band"]),
+            "deterioration": _band(row["deterioration_band"]),
+            "population": _band(row["population_band"]),
         },
     }
 
@@ -132,6 +174,7 @@ def get_zone_peer_comparison(zone_id: str, quarter: str | None = None) -> dict:
     ]
     return {
         "zone_id": zone_id, "quarter": detail["quarter"],
+        "evidence_tier": detail["evidence_tier"],
         "peer_group": detail["peer_group"], "peer_group_size": int(len(peer_rows)),
         "experience_index": detail["experience_index"],
         "peer_group_median_experience": detail["peer_group_median_experience"],
@@ -176,10 +219,25 @@ def get_zone_trend(zone_id: str) -> dict:
 
 def get_top_priority_zones(n: int = 5, quarter: str | None = None, emirate: str | None = None) -> list[dict]:
     """Which N zones should be investigated first -- ranked by Priority Score, which already
-    bakes in the confidence guardrail (low-confidence zones can't score high here)."""
-    sub, quarter = _classified(quarter, emirate)
+    bakes in the confidence guardrail (low-confidence zones can't score high here). Explicitly
+    'full' evidence tier only (`_full_tier`, not `_classified`) -- 'low' tier zones have no
+    Priority Score at all (NaN, not a real number), so they must never be candidates for a
+    ranking, however the sort happens to order NaNs."""
+    sub, quarter = _full_tier(quarter, emirate)
     ranked = sub.sort_values("priority_score", ascending=False).head(n)
     return [_summary_row(r) for _, r in ranked.iterrows()]
+
+
+def get_priority_zones(quarter: str | None = None, emirate: str | None = None) -> list[dict]:
+    """Every zone actually flagged `priority_zone == True` this quarter -- the real,
+    data-determined shortlist (currently the top ~10% of 'full' evidence-tier zones by
+    Priority Score; see `src/priority.py::PRIORITY_ZONE_FRACTION`), not a caller-chosen top N.
+    This is the set the mandatory "AI zone brief for every Priority zone" capability must
+    iterate over -- `get_top_priority_zones(n=5)` is a different, narrower question ("which
+    five first") and is the wrong tool for "brief every priority zone"."""
+    sub, quarter = _full_tier(quarter, emirate)
+    flagged = sub[sub["priority_zone"]].sort_values("priority_score", ascending=False)
+    return [_summary_row(r) for _, r in flagged.iterrows()]
 
 
 def get_weakest_zones(n: int = 10, quarter: str | None = None, emirate: str | None = None) -> list[dict]:
@@ -279,20 +337,27 @@ def get_coverage_summary(quarter: str | None = None, emirate: str | None = None)
 
 _METHODOLOGY = {
     "experience_index": {
-        "formula": "Experience = w_download*D + w_upload*U + w_latency*L (each 0-1 normalized, "
-                   "latency inverted so higher is always better), rescaled to 0-100.",
+        "formula": "Experience = w_download*D + w_upload*U + w_latency*L (each percentile-"
+                   "ranked 0-1, latency inverted so higher is always better), rescaled to 0-100.",
         "weights": EXPERIENCE_WEIGHTS,
         "note": "Deterministic. Computed once per (zone, quarter); not classified at all "
-               "below the minimum-tests threshold.",
+               "below the evidence-tier minimum (see evidence_tier below).",
     },
     "confidence_score": {
-        "formula": "Confidence = w_tests*log-scaled test volume + w_devices*(devices/tests) "
-                   "+ w_quarters*(quarters observed / 8 total quarters).",
+        "formula": "Confidence = 50*min(1, tests/200) + 30*min(1, devices/50) "
+                   "+ 20*(quarters_observed/8).",
         "weights": CONFIDENCE_WEIGHTS,
+        "tests_cap": CONFIDENCE_TESTS_CAP,
+        "devices_cap": CONFIDENCE_DEVICES_CAP,
+        "note": "A continuous strength-of-evidence signal, separate from the evidence_tier "
+               "eligibility gate (min_tests_for_reliable_evidence below is the 'full' tier bar, "
+               "not this score) and from the Priority confidence gate G(C) below.",
+    },
+    "evidence_tier": {
+        "formula": "'insufficient' (tests<10 or devices<3, no Experience Index at all) / "
+                   "'low' (10-29 tests, Experience Index shown but not shortlist-eligible) / "
+                   "'full' (>=30 tests, fully scored and shortlist-eligible).",
         "min_tests_for_reliable_evidence": MIN_TESTS_FOR_RELIABLE_EVIDENCE,
-        "tests_saturation_point": TESTS_SATURATION,
-        "note": "Below the minimum test count, a zone gets no Experience Index at all -- "
-               "'insufficient public evidence', not a low score.",
     },
     "peer_gap": {
         "formula": "Peer Gap = this zone's Experience Index - its peer group's median "
@@ -307,14 +372,20 @@ _METHODOLOGY = {
         "consecutive_declines_required": CONSECUTIVE_DECLINES_REQUIRED,
     },
     "priority_score": {
-        "formula": "Priority = (w_peer_gap*PeerGapFactor + w_ml_anomaly*MLAnomalyFactor + "
-                   "w_deterioration*DeteriorationFactor + w_population*PopulationFactor) "
-                   "* (Confidence / 100).",
+        "formula": "Priority = 100 * G(Confidence) * (w_peer_gap*PeerGapFactor "
+                   "+ w_deterioration*DeteriorationFactor + w_temporal_anomaly*TemporalAnomalyFactor "
+                   "+ w_population*PopulationExposureFactor), where each factor is a percentile "
+                   "rank (0-1) within its quarter and PopulationExposure = log(1 + population). "
+                   "G(C) = 0 if C<40, else 0.5 + 0.5*(C/100).",
         "weights": PRIORITY_WEIGHTS,
+        "confidence_gate_threshold": CONFIDENCE_GATE_THRESHOLD,
         "priority_zone_fraction": PRIORITY_ZONE_FRACTION,
-        "note": "Confidence is multiplied in, not added as a fifth factor -- a low-confidence "
-               "zone cannot reach a high Priority Score however bad its other factors look. "
-               "Sensitivity-tested (T5): +-15% weight perturbation, mean Spearman rho=0.998.",
+        "note": "Confidence is a gate, not a linear multiplier: below the threshold a zone "
+               "cannot reach the shortlist at all, however bad its other factors look; above "
+               "it, the gate runs 0.7-1.0, so confidence tunes the ranking without dominating "
+               "it. TemporalAnomaly (Isolation Forest vs. the zone's own history) is a "
+               "distinct factor; the Peer Gap ML score is not a Priority factor (the "
+               "deterministic PeerGap factor already covers that ground).",
     },
 }
 

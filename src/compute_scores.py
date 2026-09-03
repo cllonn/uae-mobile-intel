@@ -36,25 +36,39 @@ EXPERIENCE_WEIGHTS = {"download": 0.50, "upload": 0.20, "latency": 0.30}
 # Confidence Score weights: how much each evidence signal counts toward trustworthiness.
 CONFIDENCE_WEIGHTS = {"tests": 0.50, "devices": 0.30, "quarters": 0.20}
 
-# Below this many tests in a quarter, the honest output is "insufficient public evidence" --
-# no Experience/Priority classification at all, not just a low score. This is the ONE
-# authoritative eligibility gate for the whole project: every downstream module (Peer Gap,
-# trends, anomaly detection, priority, the dashboard, the copilot) reads the `insufficient_
-# evidence` flag this constant produces rather than re-deriving its own threshold -- change
-# it here and it propagates everywhere automatically. Set to 30 to match
-# notebooks/04_h3_resolution_choice.ipynb and notebooks/06_first_uae_map.ipynb's own evidence
-# bar (both independently chose 30 as "sufficiently sampled"), not the earlier placeholder of
-# 5 (which flagged only ~half of zone-quarters as insufficient and let the median-adjacent
-# tail of very thinly-tested zones get a full classification anyway). Confidence Score is a
-# separate concept from this gate -- it still differentiates strength of evidence *among*
-# zones that clear this bar (a 30-test zone scores lower confidence than a 500-test zone),
-# it just no longer decides whether a zone is classified at all.
-MIN_TESTS_FOR_RELIABLE_EVIDENCE = 1
+# Three-tier evidence gate (mentor-specified, 2026-09-01), replacing the old single
+# tests>=N cutoff. This is the ONE authoritative eligibility rule for the whole project: every
+# downstream module (Peer Gap, trends, anomaly detection, priority, the dashboard, the copilot)
+# reads the `evidence_tier` / `insufficient_evidence` fields this produces rather than
+# re-deriving its own threshold -- change these here and it propagates everywhere automatically.
+#   - Below MIN_TESTS_INSUFFICIENT tests, OR below MIN_DEVICES_INSUFFICIENT devices: honest
+#     output is "insufficient public evidence" -- no Experience Index at all, not just a low
+#     score. Below ~10 tests the quarterly average is dominated by whoever happened to test.
+#   - MIN_TESTS_INSUFFICIENT..MIN_TESTS_FULL-1 tests (and enough devices): Experience Index IS
+#     computed and shown -- informative on the map -- but excluded from the Priority shortlist,
+#     since it's unsafe to act on as a recommendation.
+#   - MIN_TESTS_FULL+ tests: fully scored and shortlist-eligible.
+# Confidence Score is a separate concept from this gate -- it still differentiates strength of
+# evidence *among* zones that have a tier (a 30-test zone scores lower confidence than a
+# 500-test zone); it just no longer decides tier membership on its own.
+MIN_TESTS_INSUFFICIENT = 10
+MIN_DEVICES_INSUFFICIENT = 3
+MIN_TESTS_FULL = 30
 
-# Test-count saturation point for the Confidence formula: zones at or above this many
-# tests/quarter get full marks on the test-volume component. Set at the brief's own cited
-# benchmark for a well-measured zone ("top zones exceed 500").
-TESTS_SATURATION = 500
+# Backward-compat alias for older call sites (e.g. src/copilot_tools.py) that surfaced a single
+# "reliable evidence" bar -- now means the full-tier bar specifically, not a general threshold.
+MIN_TESTS_FOR_RELIABLE_EVIDENCE = MIN_TESTS_FULL
+
+# Confidence Score saturation points (mentor-specified, 2026-09-01) -- the points beyond which
+# more evidence stops changing belief much. 200 tests: well-measured zones sit comfortably
+# above this. 50 devices: 500 tests from 3 phones is one person's experience, not a zone's;
+# beyond ~50 distinct devices the protection against single-user skew saturates.
+CONFIDENCE_TESTS_CAP = 200
+CONFIDENCE_DEVICES_CAP = 50
+
+# Backward-compat alias for older call sites/notebooks that imported the previous (log-scaled,
+# cap=500) confidence saturation constant -- now means the linear tests cap specifically.
+TESTS_SATURATION = CONFIDENCE_TESTS_CAP
 
 # Total quarters in the dataset window (2024 Q3 -> 2026 Q2). Used to turn "how many of these
 # quarters does this zone have any data in" into a 0-1 fraction for Confidence.
@@ -65,18 +79,18 @@ TOTAL_QUARTERS = 8
 # Building blocks
 # ---------------------------------------------------------------------------
 
-def normalize_minmax(series: pd.Series, low_pct: float = 1, high_pct: float = 99) -> pd.Series:
-    """Rescale a column onto 0-1, same method every run (reproducibility).
+def percentile_rank(series: pd.Series) -> pd.Series:
+    """Percentile rank (0-1) -- mentor-approved replacement (2026-09-01) for min-max
+    normalization, used everywhere a raw metric needs rescaling onto 0-1: Experience Index's
+    three inputs here, and every Priority factor in `src/priority.py`.
 
-    Clips to the 1st/99th percentile *before* rescaling: on the real data, a handful of
-    zone-quarters with only 1-2 tests produce fluke extreme values (e.g. download_mbps has a
-    national median of ~336 but a max of ~2,337). Without clipping, those few outliers would
-    single-handedly compress every other zone's score into a narrow band near zero.
-    """
-    lo, hi = series.quantile(low_pct / 100), series.quantile(high_pct / 100)
-    if hi == lo:
-        return pd.Series(0.5, index=series.index)
-    return ((series - lo) / (hi - lo)).clip(0, 1)
+    Why percentile rank over min-max: one zone with an extreme value would compress everything
+    else into a narrow band under min-max scaling (this data has a handful of 1-2-test zones
+    with fluke values -- e.g. download_mbps has a national median of ~336 but a max of ~2,337).
+    Percentile rank is immune to that -- the extreme zone just ranks near 1.0, everyone else's
+    relative ordering is untouched -- and it's easy to explain on a slide: 0.70 means the zone
+    sits at the 70th percentile of what's actually being ranked against."""
+    return series.rank(pct=True)
 
 
 def add_effective_latency(df: pd.DataFrame) -> pd.DataFrame:
@@ -102,38 +116,63 @@ def add_quarters_observed(df: pd.DataFrame, total_quarters: int = TOTAL_QUARTERS
 # ---------------------------------------------------------------------------
 
 def experience_index(df: pd.DataFrame, weights: dict = EXPERIENCE_WEIGHTS) -> pd.Series:
-    """Experience = w_d*D + w_u*U + w_l*L, each normalized 0-1 then combined, rescaled to 0-100.
-    Latency is inverted first (lower ms = better) so higher always means better, for all three.
-    Requires `add_effective_latency` to have already been run."""
+    """Experience = w_d*D + w_u*U + w_l*L, each percentile-ranked (0-1, mentor-specified
+    2026-09-01) then combined, rescaled to 0-100. Latency is inverted first (lower ms = better)
+    so higher always means better, for all three. Requires `add_effective_latency` to have
+    already been run."""
     assert abs(sum(weights.values()) - 1.0) < 1e-6, "weights must sum to 1"
-    d = normalize_minmax(df["download_mbps"])
-    u = normalize_minmax(df["upload_mbps"])
-    l = normalize_minmax(-df["latency_effective_ms"])
+    d = percentile_rank(df["download_mbps"])
+    u = percentile_rank(df["upload_mbps"])
+    l = percentile_rank(-df["latency_effective_ms"])
     return (100 * (weights["download"] * d + weights["upload"] * u + weights["latency"] * l)).round(1)
 
 
 def confidence_score(df: pd.DataFrame, weights: dict = CONFIDENCE_WEIGHTS,
-                      min_tests: int = MIN_TESTS_FOR_RELIABLE_EVIDENCE,
-                      tests_cap: int = TESTS_SATURATION,
-                      total_quarters: int = TOTAL_QUARTERS):
-    """Confidence = f(tests, devices, quarters observed). Returns (score 0-100, insufficient
-    flag). 'Insufficient' zones get no Experience/Priority classification at all -- a status,
-    not just a low number, per the brief's Case A / Case B example: 500 tests/300 devices/8-of-8
-    quarters = trust it; 2 tests/1 device = insufficient evidence, full stop.
-    Requires `add_quarters_observed` to have already been run."""
-    # Log scale: a handful of zones have thousands of tests while the median has ~4 -- a linear
-    # scale would let the busiest zones swamp the comparison.
-    tests_component = np.clip(np.log1p(df["tests"]) / np.log1p(tests_cap), 0, 1)
-    # devices/tests near 1 = mostly distinct testers (good); near 0 = a few phones testing
-    # repeatedly (risk of single-user skew) -- the brief's own "500 tests from 3 phones is not
-    # the same as 500 tests from 300 phones" example.
-    device_ratio = (df["devices"] / df["tests"]).clip(0, 1)
-    quarters_component = (df["quarters_observed"] / total_quarters).clip(0, 1)
+                      tests_cap: int = CONFIDENCE_TESTS_CAP,
+                      devices_cap: int = CONFIDENCE_DEVICES_CAP,
+                      total_quarters: int = TOTAL_QUARTERS) -> pd.Series:
+    """Confidence = 50*min(1, tests/200) + 30*min(1, devices/50) + 20*(quarters_observed/8)
+    (mentor-specified, 2026-09-01) -- 0-100. Tests carries the most weight because sample size
+    is the main driver of whether an average means anything. Devices is capped at 50 rather
+    than compared as a devices/tests ratio: 500 tests from 3 phones is one person's experience,
+    not a zone's, and beyond ~50 distinct devices the protection against that saturates.
+    Quarters observed carries the least weight -- it says the zone is consistently measured,
+    not that this quarter's number is right. A continuous strength-of-evidence signal,
+    independent of the evidence_tier eligibility gate below -- e.g. a 30-test/3-device zone
+    (tier 'full') can still score a middling confidence, and two 'low' tier zones (10 vs 28
+    tests) are correctly told apart by this even though they share a tier. Requires
+    `add_quarters_observed` to have already been run."""
+    tests_component = (df["tests"] / tests_cap).clip(upper=1)
+    devices_component = (df["devices"] / devices_cap).clip(upper=1)
+    quarters_component = (df["quarters_observed"] / total_quarters).clip(upper=1)
 
-    raw = 100 * (weights["tests"] * tests_component + weights["devices"] * device_ratio
+    raw = 100 * (weights["tests"] * tests_component + weights["devices"] * devices_component
                  + weights["quarters"] * quarters_component)
-    insufficient = df["tests"] < min_tests
-    return raw.round(1), insufficient
+    return raw.round(1)
+
+
+def compute_evidence_tier(df: pd.DataFrame, min_tests_insufficient: int = MIN_TESTS_INSUFFICIENT,
+                           min_devices_insufficient: int = MIN_DEVICES_INSUFFICIENT,
+                           min_tests_full: int = MIN_TESTS_FULL) -> pd.Series:
+    """Three-tier evidence eligibility gate (mentor-specified, 2026-09-01) -- see the CONFIG
+    block above for the full rationale. Returns one of 'insufficient' / 'low' / 'full' per row:
+
+      - 'insufficient': tests < min_tests_insufficient OR devices < min_devices_insufficient.
+        No Experience Index at all -- shown grey, "insufficient public evidence."
+      - 'low': enough devices and >= min_tests_insufficient tests, but < min_tests_full.
+        Experience Index IS computed and shown, but excluded from the Priority shortlist.
+      - 'full': >= min_tests_full tests (and enough devices, implied by not being insufficient).
+        Fully scored and shortlist-eligible.
+
+    This is the brief's Case A / Case B rule, extended to three states rather than two: 500
+    tests/300 devices/8-of-8 quarters = 'full', trust it outright; 2 tests/1 device =
+    'insufficient', full stop; something in between is shown but not acted on."""
+    insufficient = (df["tests"] < min_tests_insufficient) | (df["devices"] < min_devices_insufficient)
+    full = (~insufficient) & (df["tests"] >= min_tests_full)
+    tier = pd.Series("low", index=df.index, dtype="object")
+    tier[full] = "full"
+    tier[insufficient] = "insufficient"
+    return tier
 
 
 # ---------------------------------------------------------------------------
@@ -167,12 +206,22 @@ def peer_gap(df: pd.DataFrame) -> pd.DataFrame:
 
 def score_zone_quarters(df: pd.DataFrame) -> pd.DataFrame:
     """Runs every step in order: effective latency -> quarters observed -> Experience Index ->
-    Confidence Score -> insufficient-evidence rule -> Peer Gap. Returns a new DataFrame; the
-    input `df` is never modified in place."""
+    Confidence Score -> three-tier evidence gate -> Peer Gap. Returns a new DataFrame; the
+    input `df` is never modified in place.
+
+    `evidence_tier` ('insufficient' / 'low' / 'full') is the new authoritative eligibility
+    field -- `insufficient_evidence` is kept alongside it as a derived boolean (True only for
+    the 'insufficient' tier) purely so existing call sites that filter on "has an Experience
+    Index at all" (peer_gap below, the dashboard, the copilot, most tests) don't need to change;
+    they already mean "not insufficient," which is still correct for both 'low' and 'full'.
+    Anything that specifically needs shortlist-eligible zones must filter on
+    `evidence_tier == "full"` instead (see `src/priority.py`)."""
     df = add_effective_latency(df)
     df = add_quarters_observed(df)
     df["experience_index"] = experience_index(df)
-    df["confidence_score"], df["insufficient_evidence"] = confidence_score(df)
+    df["confidence_score"] = confidence_score(df)
+    df["evidence_tier"] = compute_evidence_tier(df)
+    df["insufficient_evidence"] = df["evidence_tier"] == "insufficient"
     df.loc[df["insufficient_evidence"], "experience_index"] = np.nan
     df = peer_gap(df)
     return df
