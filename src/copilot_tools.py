@@ -249,12 +249,22 @@ def get_weakest_zones(n: int = 10, quarter: str | None = None, emirate: str | No
 
 
 def get_deteriorating_zones(quarter: str | None = None, emirate: str | None = None,
-                             scope: str = "current") -> list[dict]:
+                             scope: str = "current", n: int | None = None) -> list[dict]:
     """`scope="current"` (default): zones whose *this-quarter* flag closed a 3+ quarter
     decline -- "which areas are deteriorating right now." `scope="ever_in_window"`: any zone
     that hit this pattern at least once across all 8 quarters -- a broader, historical count.
     These are genuinely different questions; keeping them as separate, named parameters
-    (rather than one ambiguous "deteriorating zones" list) is deliberate."""
+    (rather than one ambiguous "deteriorating zones" list) is deliberate.
+
+    `n`, when given, narrows the (already-flagged) result to the N strongest current-quarter
+    cases, ranked by `trend_pts_per_qtr` ascending (most negative = fastest decline vs. peers).
+    `src/priority.py`'s own `factor_deterioration` can't be used for this ranking -- it's a
+    percentile rank of the boolean `deteriorating` flag, so every deteriorating zone in a
+    quarter ties at the same value by construction; `trend_pts_per_qtr` (from src/trends.py,
+    already computed, unmodified here) is the only continuous severity signal available. `n`
+    only narrows which already-flagged zones come back -- it never changes who counts as
+    deteriorating, and never touches the Priority Score itself. `n=None` (the default) keeps
+    every flagged zone, unranked, exactly as before."""
     if scope == "ever_in_window":
         df = _load()
         sub = df[~df["insufficient_evidence"]]
@@ -270,6 +280,8 @@ def get_deteriorating_zones(quarter: str | None = None, emirate: str | None = No
         return [_summary_row(r) for _, r in latest_rows.iterrows()]
     sub, quarter = _classified(quarter, emirate)
     flagged = sub[sub["deteriorating"]]
+    if n is not None:
+        flagged = flagged.sort_values("trend_pts_per_qtr", ascending=True).head(n)
     return [_summary_row(r) for _, r in flagged.iterrows()]
 
 
@@ -298,6 +310,63 @@ def get_high_population_weak_zones(n: int = 10, quarter: str | None = None, emir
     candidates = sub[(sub["experience_index"] <= exp_median) & (sub["population"] >= pop_median)]
     ranked = candidates.sort_values("population", ascending=False).head(n)
     return [_summary_row(r) for _, r in ranked.iterrows()]
+
+
+def get_above_median_download_zones(quarter: str | None = None, emirate: str | None = None) -> list[dict]:
+    """Zones whose download speed is above the median download speed among classified zones in
+    the same quarter/emirate scope -- the median is computed here, once, deterministically, over
+    the exact same scope the caller asked about (never a fixed/national number, never estimated
+    by the narrator or an LLM). Ranked download-speed-descending so the strongest zones lead."""
+    sub, quarter = _classified(quarter, emirate)
+    if sub.empty:
+        return []
+    median_download = round(float(sub["download_mbps"].median()), 2)
+    above = sub[sub["download_mbps"] > median_download].sort_values("download_mbps", ascending=False)
+    return [
+        {**_summary_row(r), "download_mbps": _num(r["download_mbps"]), "median_download_mbps": median_download}
+        for _, r in above.iterrows()
+    ]
+
+
+# Raw supporting measurements get_metric_extreme can report a single min/max/median value for
+# -- explicitly NOT the Experience Index (a computed composite; that's get_weakest_zones/
+# get_top_priority_zones etc.). `download_mbps`/`upload_mbps` map to their own raw columns;
+# `latency_ms` maps to `latency_effective_ms` -- the same "loaded latency, falling back to
+# unloaded" column every other latency figure in this app already shows the user (see
+# src/compute_scores.py::add_effective_latency) -- never the raw, less-representative column.
+_METRIC_COLUMNS = {"download_mbps": "download_mbps", "upload_mbps": "upload_mbps", "latency_ms": "latency_effective_ms"}
+_METRIC_UNITS = {"download_mbps": "Mbps", "upload_mbps": "Mbps", "latency_ms": "ms"}
+
+
+def get_metric_extreme(metric: str, operation: str, quarter: str | None = None,
+                        emirate: str | None = None) -> dict:
+    """The single verified min/max/median value of one raw measurement (download_mbps,
+    upload_mbps, or latency_ms) over the requested quarter/emirate scope -- computed here, once,
+    deterministically (pandas .min()/.max()/.median()), never estimated or calculated by an LLM.
+    For 'min'/'max' this also returns the exact H3 zone that achieves it, so the frontend can
+    highlight it; 'median' has no single zone that IS the median, so `zone_id` is None there --
+    a caller must not invent one."""
+    col = _METRIC_COLUMNS.get(metric)
+    if col is None:
+        return {"error": f"unknown metric '{metric}', expected one of {list(_METRIC_COLUMNS)}"}
+    if operation not in ("min", "max", "median"):
+        return {"error": f"unknown operation '{operation}', expected 'min', 'max', or 'median'"}
+
+    sub, quarter = _classified(quarter, emirate)
+    base = {"metric": metric, "operation": operation, "quarter": quarter,
+            "emirate": emirate or "All UAE", "unit": _METRIC_UNITS[metric]}
+    if sub.empty:
+        return {**base, "value": None, "zone_id": None, "error": "no_classified_zones_in_scope"}
+
+    if operation == "median":
+        return {**base, "value": round(float(sub[col].median()), 2), "zone_id": None}
+
+    idx = sub[col].idxmin() if operation == "min" else sub[col].idxmax()
+    row = sub.loc[idx]
+    return {
+        **base, "value": _num(row[col]), "zone_id": row["h3_cell"],
+        "zone_emirate": row["emirate"], "zone_peer_group": row["peer_group"],
+    }
 
 
 def get_coverage_summary(quarter: str | None = None, emirate: str | None = None) -> dict:

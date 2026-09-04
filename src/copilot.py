@@ -15,12 +15,27 @@ this challenge asks for (Dubai/Sharjah-style emirate mentions). That is delibera
 as this goes today -- free-form question answering is an explicit stretch goal in the brief,
 not a requirement.
 """
+import difflib
 import os
 import re
 
 from src import copilot_tools as ct
 
-EMIRATES = ["Abu Dhabi", "Dubai", "Sharjah", "Ajman", "Umm Al Quwain", "Ras Al Khaimah", "Fujairah"]
+# Central emirate alias table -- canonical name -> every accepted alias/abbreviation, each
+# already lowercase (matching is done on normalized, lowercased text; see _normalize_geo_text).
+# This is the ONLY place emirate text is resolved: the canonical name it returns is what gets
+# passed as the deterministic tool's `emirate` argument, resolved BEFORE that tool ever runs --
+# the LLM never sees raw emirate text and never filters a result by emirate itself.
+EMIRATE_ALIASES: dict[str, list[str]] = {
+    "Abu Dhabi": ["abu dhabi", "abudhabi", "auh", "ad"],
+    "Dubai": ["dubai", "dxb"],
+    "Sharjah": ["sharjah", "shj"],
+    "Ajman": ["ajman", "ajm"],
+    "Umm Al Quwain": ["umm al quwain", "umm al-quwain", "uaq"],
+    "Ras Al Khaimah": ["ras al khaimah", "ras al-khaimah", "rak"],
+    "Fujairah": ["fujairah", "fuj", "fjr"],
+}
+EMIRATES = list(EMIRATE_ALIASES)  # canonical names only -- kept for anything that just needs the list
 
 # ---------------------------------------------------------------------------
 # Hard grounding / refusal -- deterministic, checked BEFORE any tool routing.
@@ -76,7 +91,11 @@ def check_data_source_question(question: str) -> str | None:
 _NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "ten": 10}
 
 
-def _extract_n(question: str, default: int) -> int:
+def _extract_explicit_n(question: str) -> int | None:
+    """Same digit/number-word detection as `_extract_n`, but returns None (not a fallback
+    default) when no explicit count is present -- lets a caller tell 'no number given' apart
+    from 'given N', which matters wherever "no number" and "n=<some number>" mean genuinely
+    different things (e.g. get_deteriorating_zones: no number keeps the full flagged list)."""
     q = question.lower()
     m = re.search(r"\b(\d+)\b", q)
     if m:
@@ -84,14 +103,140 @@ def _extract_n(question: str, default: int) -> int:
     for word, n in _NUMBER_WORDS.items():
         if re.search(rf"\b{word}\b", q):
             return n
-    return default
+    return None
+
+
+def _extract_n(question: str, default: int) -> int:
+    n = _extract_explicit_n(question)
+    return default if n is None else n
+
+
+def _wants_single_zone(q: str) -> bool:
+    """True for genuinely singular phrasing ("which ZONE/AREA...", not "...ZONES/AREAS...") --
+    e.g. "Which zone has the lowest experience?" or "which area deteriorated the most?" want
+    exactly one answer, not the tool's usual top-N list. \\bzone\\b / \\barea\\b never matches
+    inside "zones"/"areas" (no word boundary before the trailing 's'), so this only fires on
+    real singular wording, never a plural one."""
+    return bool(re.search(r"\b(zone|area|hex(agon)?)\b", q))
+
+
+def _normalize_geo_text(text: str) -> str:
+    """Lowercases, turns hyphens into spaces, and collapses whitespace -- so 'Ras Al-Khaimah',
+    'ras al  khaimah', and 'RAS AL KHAIMAH' all normalize to the same string before alias
+    matching. Applied only for emirate detection; never changes what reaches the tool/LLM."""
+    return re.sub(r"\s+", " ", text.lower().replace("-", " ")).strip()
 
 
 def _extract_emirate(question: str) -> str | None:
-    for emirate in EMIRATES:
-        if emirate.lower() in question.lower():
-            return emirate
+    """Resolves the emirate scope from EMIRATE_ALIASES only -- no fuzzy guessing, so an
+    ambiguous-looking short code always resolves the same, explicit way. Matched with word
+    boundaries on normalized text, so a two/three-letter code like 'ad' or 'rak' only matches as
+    a standalone word/phrase, never as a substring inside an unrelated word."""
+    normalized = _normalize_geo_text(question)
+    for canonical, aliases in EMIRATE_ALIASES.items():
+        for alias in aliases:
+            if re.search(rf"\b{re.escape(alias)}\b", normalized):
+                return canonical
     return None
+
+
+# ---------------------------------------------------------------------------
+# Metric-extreme detection -- "lowest recorded download speed" etc. This is the fix for the
+# router previously mapping ANY "lowest/worst/highest" question to weakest/top-priority
+# EXPERIENCE zones: a raw supporting measurement (download_mbps, upload_mbps, latency_ms) is a
+# fundamentally different question from the Experience Index, so it must never fall into the
+# get_weakest_zones/get_top_priority_zones branches below -- this block runs BEFORE those and
+# returns early whenever a metric word is present, with its own min/max/median resolution.
+# ---------------------------------------------------------------------------
+
+_METRIC_EXACT_ALIASES: dict[str, list[str]] = {
+    "download_mbps": ["download speed", "download", "downlink", "downlod", "downlaod", "down load"],
+    "upload_mbps": ["upload speed", "upload", "uplink", "uplod", "uplaod", "up load"],
+    "latency_ms": ["latency", "ping", "latancy", "lattency"],
+}
+_OPERATION_EXACT_ALIASES: dict[str, list[str]] = {
+    "min": ["lowest", "minimum", "min"],
+    "max": ["highest", "maximum", "max", "higest", "heighest", "highst"],
+    "median": ["median"],
+}
+# "worst"/"best" are metric-RELATIVE, not a fixed min/max: worse download/upload is a LOWER
+# number, but worse latency is a HIGHER number (latency: lower is always better) -- resolved
+# against the matched metric in _resolve_metric_query below, never assumed to mean "min".
+_VALENCE_EXACT_ALIASES: dict[str, list[str]] = {
+    "worst": ["worst", "wrost", "worse"],
+    "best": ["best", "bset", "better"],
+}
+
+# Fuzzy fallback whitelist -- ONLY these words, matched with difflib (deterministic string
+# similarity; not an LLM, never asked to interpret meaning) when a typo isn't in the exact-alias
+# lists above. _METRIC_FLOOR is the bar to even consider a word "maybe a metric typo" at all
+# (below this, an unrelated word must never be treated as a metric question); the higher
+# _CONFIDENCE_THRESHOLD is the bar to auto-run the tool without asking first.
+_METRIC_FUZZY_WHITELIST = {"download": "download_mbps", "upload": "upload_mbps", "latency": "latency_ms"}
+_OPERATION_FUZZY_WHITELIST = {"lowest": "min", "minimum": "min", "highest": "max", "maximum": "max", "median": "median"}
+_METRIC_FLOOR = 0.55
+_CONFIDENCE_THRESHOLD = 0.72
+
+
+def _exact_phrase_match(normalized: str, aliases: dict[str, list[str]]) -> str | None:
+    for key, terms in aliases.items():
+        for term in terms:
+            if re.search(rf"\b{re.escape(term)}\b", normalized):
+                return key
+    return None
+
+
+def _best_fuzzy_match(normalized: str, whitelist: dict[str, str]) -> tuple[str | None, float]:
+    """Best (resolved_value, confidence) across every word in `normalized` against `whitelist`'s
+    keys, or (None, 0.0) if no word reaches _METRIC_FLOOR at all."""
+    best_value, best_ratio = None, 0.0
+    for word in normalized.split():
+        for term, value in whitelist.items():
+            ratio = difflib.SequenceMatcher(None, word, term).ratio()
+            if ratio > best_ratio:
+                best_value, best_ratio = value, ratio
+    return (best_value, best_ratio) if best_ratio >= _METRIC_FLOOR else (None, best_ratio)
+
+
+def _resolve_metric_query(question: str) -> dict | None:
+    """Returns None if this isn't a metric question at all (no metric word/typo found even
+    fuzzily) -- lets route() fall through to its other branches unaffected. Otherwise returns
+    {'metric', 'operation', 'confidence'} when confident enough to run, or
+    {'clarify': "<best-guess phrase>"} when the match is real but too uncertain to act on
+    without asking -- e.g. "Did you mean lowest download speed?" -- never silently guessed."""
+    normalized = _normalize_geo_text(question)
+
+    metric = _exact_phrase_match(normalized, _METRIC_EXACT_ALIASES)
+    metric_confidence = 1.0 if metric else 0.0
+    if metric is None:
+        metric, metric_confidence = _best_fuzzy_match(normalized, _METRIC_FUZZY_WHITELIST)
+    if metric is None:
+        return None  # no metric signal at all -- not this router's question
+
+    operation = _exact_phrase_match(normalized, _OPERATION_EXACT_ALIASES)
+    op_confidence = 1.0 if operation else 0.0
+    if operation is None:
+        valence = _exact_phrase_match(normalized, _VALENCE_EXACT_ALIASES)
+        if valence:
+            operation, op_confidence = valence, 1.0
+    if operation is None:
+        operation, op_confidence = _best_fuzzy_match(normalized, _OPERATION_FUZZY_WHITELIST)
+
+    if operation in ("worst", "best"):
+        # latency: lower is better, so "worst" = highest latency; download/upload: higher is
+        # better, so "worst" = lowest speed. Flip resolved here, once, from the matched metric --
+        # never left for the LLM to reason about.
+        lower_is_better = metric == "latency_ms"
+        wants_bad = operation == "worst"
+        operation = ("max" if wants_bad else "min") if lower_is_better else ("min" if wants_bad else "max")
+
+    confidence = min(metric_confidence, op_confidence)
+    if operation is None or confidence < _CONFIDENCE_THRESHOLD:
+        metric_word = {"download_mbps": "download", "upload_mbps": "upload", "latency_ms": "latency"}[metric]
+        op_word = {"min": "lowest", "max": "highest", "median": "median", None: "lowest"}.get(operation, "lowest")
+        return {"clarify": f"{op_word} {metric_word} speed" if metric != "latency_ms" else f"{op_word} {metric_word}"}
+
+    return {"metric": metric, "operation": operation, "confidence": confidence}
 
 
 def route(question: str, zone_id: str | None = None) -> tuple[str, dict]:
@@ -114,16 +259,48 @@ def route(question: str, zone_id: str | None = None) -> tuple[str, dict]:
         return "get_zone_peer_comparison", {"zone_id": zone_id}
 
     if re.search(r"\b(deteriorat\w*|declin\w*|worse over time)\b", q):
-        return "get_deteriorating_zones", {"emirate": emirate}
+        args = {"emirate": emirate}
+        # No explicit count keeps the full flagged list (unchanged default behavior) UNLESS the
+        # question is itself singular ("which AREA deteriorated the most" wants exactly one
+        # answer, not all 17) -- same singular-phrasing signal get_weakest_zones uses below.
+        explicit_n = _extract_explicit_n(q)
+        if explicit_n is not None:
+            args["n"] = explicit_n
+        elif _wants_single_zone(q):
+            args["n"] = 1
+        return "get_deteriorating_zones", args
     if re.search(r"\banomal|unusual\b", q):
         kind = "temporal" if re.search(r"\bhistory|own past|over time\b", q) else "peer_gap"
         return "get_anomalous_zones", {"kind": kind, "emirate": emirate}
     if re.search(r"\bpopulation\b", q) and re.search(r"\bweak\b", q):
         return "get_high_population_weak_zones", {"emirate": emirate}
+    # "which zones have greater than the median download" (a LISTING of zones above the median)
+    # is a different question from "what is the median download speed" (a single value) even
+    # though both contain 'median'+'download' -- the comparison word ('greater than'/'above'/...)
+    # is what makes it a listing; without one, it falls through to the metric-extreme block below.
+    if (re.search(r"\bmedian\b", q) and re.search(r"\bdownload\b", q)
+            and re.search(r"\b(greater than|above|more than|higher than|over)\b", q)):
+        return "get_above_median_download_zones", {"emirate": emirate}
+
+    metric_query = _resolve_metric_query(q)
+    if metric_query is not None:
+        if "clarify" in metric_query:
+            return "clarify", {"suggestion": metric_query["clarify"]}
+        return "get_metric_extreme", {
+            "metric": metric_query["metric"], "operation": metric_query["operation"], "emirate": emirate,
+        }
+
     if re.search(r"\b(priorit\w*|investigate\w*)\b", q):
         return "get_top_priority_zones", {"n": _extract_n(q, 5), "emirate": emirate}
-    if re.search(r"\bweak(est)?\b", q):
-        return "get_weakest_zones", {"n": _extract_n(q, 10), "emirate": emirate}
+    # "weakest" is the canonical wording, but a decision-maker is just as likely to ask for the
+    # "lowest" or "worst" -- same tool, same ranking (ascending Experience Index), just different
+    # words for the same idea.
+    if re.search(r"\b(weak(est)?|lowest|worst)\b", q):
+        # Singular phrasing means the caller wants exactly one answer, not the usual top-10 list
+        # -- e.g. "Which zone has the lowest experience?" should return (and the map should
+        # highlight) exactly one zone, not ten.
+        default_n = 1 if _wants_single_zone(q) else 10
+        return "get_weakest_zones", {"n": _extract_n(q, default_n), "emirate": emirate}
     if re.search(r"\bcoverage|represent|how much of\b", q):
         return "get_coverage_summary", {"emirate": emirate}
 
@@ -140,6 +317,8 @@ _TOOLS = {
     "get_deteriorating_zones": ct.get_deteriorating_zones,
     "get_anomalous_zones": ct.get_anomalous_zones,
     "get_high_population_weak_zones": ct.get_high_population_weak_zones,
+    "get_above_median_download_zones": ct.get_above_median_download_zones,
+    "get_metric_extreme": ct.get_metric_extreme,
     "get_coverage_summary": ct.get_coverage_summary,
     "get_methodology": ct.get_methodology,
 }
@@ -156,17 +335,28 @@ _TOOLS = {
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = (
-    "You explain UAE mobile network experience data to a decision-maker. You will be given "
-    "a user question and a JSON object that was already computed by a deterministic pipeline "
-    "(Experience Index, Confidence Score, Peer Gap, trend, ML anomaly flags, Priority Score). "
-    "Explain the JSON in plain, concise language. "
+    "You explain UAE mobile network experience data to a decision-maker who is not a network "
+    "engineer or data scientist. You will be given a user question and a JSON object that was "
+    "already computed by a deterministic pipeline (Experience Index, Confidence Score, Peer "
+    "Gap, trend, ML anomaly flags, Priority Score). The dashboard map has already highlighted, "
+    "directly from that JSON's own zone_id field(s), the exact area(s) it names -- your only "
+    "job is to explain in plain language what the highlighted map is showing. "
     "Rules, no exceptions: "
-    "1) Use only numbers that appear in the JSON -- never calculate, estimate, or round a new "
+    "1) Keep the answer to 1-3 short sentences, unless the user explicitly asks for more detail. "
+    "2) Never state a raw H3 cell ID, and never list the areas one by one -- refer to them as "
+    "'these areas' / 'this area' and say they're highlighted on the map. The map is the visual "
+    "answer; your text only explains what it shows. "
+    "3) Write for a decision-maker, not an engineer: never use the internal terms 'peer "
+    "underperformance', 'temporal anomaly', 'population exposure', 'evidence tier', "
+    "'percentile rank', 'Isolation Forest', or 'H3' -- say 'worse than similar areas', "
+    "'unusual recent changes', 'number of people affected', 'not enough public measurements', "
+    "etc. instead. Only use the technical terms if the user's own question already uses them or "
+    "explicitly asks for technical/methodology detail. "
+    "4) Use only numbers that appear in the JSON -- never calculate, estimate, or round a new "
     "number of your own. "
-    "2) If a field is missing or null, say the data is not available -- never guess. "
-    "3) This is public, outside-in mobile measurement data with no operator attribution -- "
-    "never attribute a result to e& or any specific operator, site, or tower. "
-    "4) Keep the answer under 120 words."
+    "5) If a field is missing or null, say the data is not available -- never guess. "
+    "6) This is public, outside-in mobile measurement data with no operator attribution -- "
+    "never attribute a result to e& or any specific operator, site, or tower."
 )
 
 
@@ -174,95 +364,212 @@ def _llm_available() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY"))
 
 
-def _llm_narrate(question: str, tool_name: str, tool_result) -> str:
+def _llm_narrate(question: str, tool_name: str, tool_result, tool_args: dict) -> str:
     import anthropic  # imported lazily so the module loads fine without the package installed
 
     client = anthropic.Anthropic()
     message = client.messages.create(
         model="claude-sonnet-5",
-        max_tokens=300,
+        max_tokens=200,
         system=SYSTEM_PROMPT,
         messages=[{
             "role": "user",
-            "content": f"Question: {question}\n\nTool called: {tool_name}\nTool result (JSON):\n{tool_result}",
+            "content": (
+                f"Question: {question}\n\nTool called: {tool_name}\n"
+                f"Tool arguments (the exact scope already applied, e.g. emirate -- state this "
+                f"scope in your answer if one was given; do not infer or apply a different one "
+                f"yourself): {tool_args}\n"
+                f"Tool result (JSON):\n{tool_result}"
+            ),
         }],
     )
     return message.content[0].text
 
 
-def _template_narrate(question: str, tool_name: str, tool_result) -> str:
+# Plain-language stand-ins for the internal factor/field names -- never shown to a decision-
+# maker as raw identifiers (`peer_gap`, `temporal_anomaly`, ...). The underlying data, tools,
+# and Priority calculation are untouched; only this narration-facing vocabulary changes.
+#   peer underperformance -> worse than similar areas
+#   deterioration          -> getting worse over time
+#   temporal anomaly       -> unusual recent changes
+#   population exposure    -> how many people may be affected
+def _join_and(items: list[str]) -> str:
+    if len(items) <= 1:
+        return items[0] if items else ""
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+_PLAIN_FACTORS = {
+    "peer_gap": "how it compares with similar areas",
+    "temporal_anomaly": "unusual recent changes",
+    "deterioration": "getting worse over time",
+    "population": "how many people may be affected",
+}
+
+_PRIORITY_CRITERIA_SENTENCE = (
+    "They were selected based on how they compare with similar areas, whether performance is "
+    "getting worse or changing unusually, and how many people may be affected."
+)
+
+
+def _lead(n: int) -> tuple[str, str]:
+    """('This is'/'These are', 'it'/'them') for a result set of size n -- shared by every
+    listing narration below so singular vs. plural phrasing never has to be duplicated."""
+    return ("This is", "it") if n == 1 else ("These are", "them")
+
+
+def _scope_suffix(emirate: str | None) -> str:
+    """' in {emirate}' (resolved, canonical -- never re-guessed here) or '' -- the fragment every
+    listing narration below inserts right after its subject, so a scoped question's answer
+    always states the exact scope the tool was actually run against."""
+    return f" in {emirate}" if emirate else ""
+
+
+def _priority_listing_narration(n: int, quarter: str, emirate: str | None) -> str:
+    lead, pronoun = _lead(n)
+    where = _scope_suffix(emirate)
+    subject = "the area that needs the most attention" if n == 1 else f"the {n} areas that need the most attention"
+    return f"{lead} {subject}{where} this quarter ({quarter}). {_PRIORITY_CRITERIA_SENTENCE} I highlighted {pronoun} on the map."
+
+
+def _weakest_listing_narration(n: int, quarter: str, emirate: str | None) -> str:
+    lead, pronoun = _lead(n)
+    where = f" in {emirate} for {quarter}" if emirate else f" in {quarter}"
+    if n == 1:
+        return f"This area has the lowest measured mobile experience{where}. I highlighted it in red on the map."
+    return f"{lead} the {n} areas with the lowest measured mobile experience{where}. I highlighted {pronoun} on the map."
+
+
+def _deteriorating_listing_narration(n: int, quarter: str, emirate: str | None) -> str:
+    where = _scope_suffix(emirate)
+    if n == 1:
+        return (f"This area{where} has been getting worse over time compared with similar areas, "
+                f"for at least three quarters in a row (as of {quarter}). I highlighted it on the map.")
+    lead, pronoun = _lead(n)
+    return (f"{lead} {n} areas{where} where performance has been getting worse over time compared "
+            f"with similar areas, for at least three quarters in a row (as of {quarter}). "
+            f"I highlighted {pronoun} on the map.")
+
+
+def _anomalous_listing_narration(question: str, n: int, quarter: str, emirate: str | None) -> str:
+    lead, pronoun = _lead(n)
+    subject = "one area" if n == 1 else f"{n} areas"
+    where = _scope_suffix(emirate)
+    is_temporal = bool(re.search(r"\bhistory|own past|over time\b", question.lower()))
+    clause = "compared with their own recent history" if is_temporal else "compared with similar areas"
+    return f"{lead} {subject}{where} showing unusual recent changes {clause}, in {quarter}. I highlighted {pronoun} on the map."
+
+
+def _high_population_weak_listing_narration(n: int, quarter: str, emirate: str | None) -> str:
+    lead, pronoun = _lead(n)
+    subject = "one area" if n == 1 else f"{n} areas"
+    where = _scope_suffix(emirate)
+    return (f"{lead} {subject}{where} with weak mobile experience where a large number of people "
+            f"may be affected, in {quarter}. I highlighted {pronoun} on the map.")
+
+
+def _above_median_download_narration(n: int, quarter: str, emirate: str | None) -> str:
+    lead, pronoun = _lead(n)
+    where = _scope_suffix(emirate)
+    subject = "the area with" if n == 1 else f"{n} areas with"
+    return f"{lead} {subject}{where} download speeds above the median for {quarter}. I highlighted {pronoun} on the map."
+
+
+_LISTING_NARRATORS = {
+    "get_top_priority_zones": lambda q, n, quarter, emirate: _priority_listing_narration(n, quarter, emirate),
+    "get_priority_zones": lambda q, n, quarter, emirate: _priority_listing_narration(n, quarter, emirate),
+    "get_weakest_zones": lambda q, n, quarter, emirate: _weakest_listing_narration(n, quarter, emirate),
+    "get_deteriorating_zones": lambda q, n, quarter, emirate: _deteriorating_listing_narration(n, quarter, emirate),
+    "get_anomalous_zones": lambda q, n, quarter, emirate: _anomalous_listing_narration(q, n, quarter, emirate),
+    "get_high_population_weak_zones": lambda q, n, quarter, emirate: _high_population_weak_listing_narration(n, quarter, emirate),
+    "get_above_median_download_zones": lambda q, n, quarter, emirate: _above_median_download_narration(n, quarter, emirate),
+}
+
+
+def _template_narrate(question: str, tool_name: str, tool_result, tool_args: dict | None = None) -> str:
     """Deterministic fallback narrator -- no LLM call, plain string formatting over the same
     JSON an LLM would receive. Exists so the full pipeline is demoable and testable with zero
-    external dependencies; swap in `_llm_narrate` the moment a key is available."""
-    if tool_name in ("get_top_priority_zones", "get_priority_zones", "get_weakest_zones",
-                     "get_high_population_weak_zones", "get_deteriorating_zones", "get_anomalous_zones"):
+    external dependencies; swap in `_llm_narrate` the moment a key is available. Every branch
+    stays to 1-3 short, plain-language sentences (see _PLAIN_FACTORS) and never states a raw H3
+    id or lists areas one by one -- the map (driven straight from this same tool_result, in the
+    frontend) is the visual answer; this text only explains what it shows. `tool_args['emirate']`
+    (already resolved by route()/EMIRATE_ALIASES before the tool ever ran) is read here only to
+    state that scope in the sentence -- never to filter or re-derive it."""
+    tool_args = tool_args or {}
+    if tool_name in _LISTING_NARRATORS:
+        emirate = tool_args.get("emirate")
         if not tool_result:
-            return "No zones matched this query at the requested evidence threshold."
-        lines = [
-            f"{i+1}. Zone {z['zone_id'][-6:]} ({z['emirate']}, {z['peer_group']}) -- "
-            f"Experience {z.get('experience_index')}, Confidence {z.get('confidence_score')}, "
-            + (f"Priority {z['priority_score']}" if z.get("evidence_tier") == "full"
-               else "not shortlist-eligible (10-29 tests, low-confidence evidence)")
-            for i, z in enumerate(tool_result[:10])
-        ]
-        return f"Found {len(tool_result)} matching zone(s):\n" + "\n".join(lines)
+            where = f" in {emirate}" if emirate else ""
+            return f"No areas matched this query{where} at the requested evidence threshold."
+        return _LISTING_NARRATORS[tool_name](question, len(tool_result), tool_result[0]["quarter"], emirate)
 
     if tool_name == "get_zone_details":
         if tool_result.get("evidence_status") == "insufficient_evidence":
-            return (f"Zone {tool_result['zone_id'][-6:]}: {tool_result['message']} "
-                    f"({tool_result['tests']} tests, {tool_result['devices']} devices this quarter.)")
+            return (f"Not enough public measurements this quarter ({tool_result['tests']} tests, "
+                    f"{tool_result['devices']} devices) to score this area reliably.")
         if tool_result.get("error"):
-            return f"No data found: {tool_result['error']}."
+            return "No data found for this area this quarter."
 
-        base = (
-            f"Zone {tool_result['zone_id'][-6:]} ({tool_result['emirate']}, {tool_result['peer_group']}), "
-            f"{tool_result['quarter']}: Experience Index {tool_result['experience_index']} vs. peer median "
-            f"{tool_result['peer_group_median_experience']} ({tool_result['peer_gap']:+.1f} pts). "
-            f"Confidence {tool_result['confidence_score']}/100 from {tool_result['tests']} tests / "
-            f"{tool_result['devices']} devices across {tool_result['quarters_observed']}/8 quarters."
-        )
-        # 'low' evidence tier (10-29 tests): a real Experience Index exists above, but
-        # src/priority.py never computes a Priority Score for this tier at all -- no Priority
-        # Score line to show, and no factor breakdown to invent one from.
+        # 'low' evidence tier (10-29 tests): a real Experience Index exists, but
+        # src/priority.py never computes a Priority Score for this tier at all -- no factor
+        # breakdown or confidence claim to make beyond "not eligible."
         if tool_result.get("evidence_tier") != "full":
-            return (
-                f"{base} This zone has low-confidence evidence (10-29 tests) -- shown, but "
-                f"not eligible for the Priority shortlist; it is informative, not a safe "
-                f"recommendation. This reflects public measurement patterns only; it cannot "
-                f"identify an operator-specific cause."
-            )
-        high_factors = [k for k, v in tool_result["priority_factors"].items() if v == "High"]
-        return (
-            f"{base} Priority Score {tool_result['priority_score']}"
-            f"{' (flagged for investigation)' if tool_result['priority_zone'] else ''}, driven mainly by: "
-            + (", ".join(high_factors) if high_factors else "no single dominant factor")
-            + ". This reflects public measurement patterns only; it cannot identify an operator-specific cause."
-        )
+            return (f"This area's Experience Index is {tool_result['experience_index']}/100, but "
+                    f"there aren't enough public measurements yet (only {tool_result['tests']} tests) "
+                    f"for it to be considered for the Priority list.")
+
+        q = question.lower()
+        if re.search(r"\bconfiden", q):
+            return (f"Confidence is {tool_result['confidence_score']}/100, based on "
+                     f"{tool_result['tests']} tests from {tool_result['devices']} devices across "
+                     f"{tool_result['quarters_observed']}/8 quarters.")
+        if re.search(r"\bmeasurements?\b.*(support|behind|recommend)", q):
+            return (f"This recommendation is based on {tool_result['tests']} tests from "
+                    f"{tool_result['devices']} devices across {tool_result['quarters_observed']}/8 "
+                    f"quarters ({tool_result['confidence_score']}/100 confidence).")
+
+        # Default: "why is this zone high priority" and any other zone-scoped question that
+        # reaches this tool.
+        high_factors = [_PLAIN_FACTORS[k] for k, v in tool_result["priority_factors"].items() if v == "High"]
+        factor_text = _join_and(high_factors) if high_factors else "no single standout factor"
+        return (f"This area scored {tool_result['priority_score']} on Priority, driven mainly by "
+                f"{factor_text}. Its Experience Index is {tool_result['experience_index']}/100 vs. "
+                f"a typical {tool_result['peer_group_median_experience']} for similar areas.")
 
     if tool_name == "get_zone_peer_comparison":
-        return (
-            f"Zone {tool_result['zone_id'][-6:]} vs. its {tool_result['peer_group_size']} "
-            f"{tool_result['peer_group']} peers ({tool_result['quarter']}): Experience Index "
-            f"{tool_result['experience_index']} vs. peer median {tool_result['peer_group_median_experience']}, "
-            f"a gap of {tool_result['peer_gap']:+.1f} points ({tool_result['peer_gap_pct']:+.1f}%)."
-        )
+        return (f"Compared with {tool_result['peer_group_size']} similar areas this quarter, this "
+                f"area's Experience Index is {tool_result['experience_index']} vs. a typical "
+                f"{tool_result['peer_group_median_experience']} for that group "
+                f"({tool_result['peer_gap']:+.1f} pts).")
 
     if tool_name == "get_zone_trend":
-        cur = "currently deteriorating" if tool_result.get("currently_deteriorating") else "not currently flagged as deteriorating"
-        return (
-            f"Zone {tool_result['zone_id'][-6:]}: {cur}, trend {tool_result['trend_pts_per_qtr']} "
-            f"Experience-Index points/quarter over its {tool_result['quarters_observed']} observed quarters. "
-            f"({'Has' if tool_result['ever_deteriorated_in_window'] else 'Has not'} hit the 3-quarter "
-            f"decline pattern at some point in the 8-quarter window.)"
-        )
+        cur = "getting worse over time" if tool_result.get("currently_deteriorating") else "not currently getting worse"
+        return (f"This area is {cur}, trending {tool_result['trend_pts_per_qtr']} Experience-Index "
+                f"points per quarter over {tool_result['quarters_observed']} observed quarters.")
+
+    if tool_name == "get_metric_extreme":
+        if tool_result.get("error") or tool_result.get("value") is None:
+            where = f" in {tool_result['emirate']}" if tool_result.get("emirate", "All UAE") != "All UAE" else ""
+            return f"No measurements are available for this{where} this quarter."
+        metric_label = {"download_mbps": "download speed", "upload_mbps": "upload speed",
+                         "latency_ms": "latency"}[tool_result["metric"]]
+        op_label = {"min": "lowest recorded", "max": "highest recorded", "median": "median"}[tool_result["operation"]]
+        where = f" in {tool_result['emirate']}" if tool_result.get("emirate", "All UAE") != "All UAE" else ""
+        sentence = (f"The {op_label} {metric_label}{where} in {tool_result['quarter']} is "
+                    f"{tool_result['value']} {tool_result['unit']}.")
+        if tool_result.get("zone_id"):
+            sentence += " I highlighted the matching area on the map."
+        return sentence
 
     if tool_name == "get_coverage_summary":
         return (
             f"{tool_result['emirate']}, {tool_result['quarter']}: {tool_result['classified_zones']} of "
-            f"{tool_result['measured_zones']} measured zones meet the evidence threshold, representing "
-            f"{tool_result['population_represented_pct']}% of the population "
+            f"{tool_result['measured_zones']} measured areas have enough public measurements to score, "
+            f"representing {tool_result['population_represented_pct']}% of the population "
             f"({tool_result['population_represented']:,} of {tool_result['population_universe']:,}). "
-            f"{tool_result['priority_zones']} zone(s) flagged for investigation."
+            f"{tool_result['priority_zones']} area(s) flagged for investigation."
         )
 
     if tool_name == "get_methodology":
@@ -271,14 +578,18 @@ def _template_narrate(question: str, tool_name: str, tool_result) -> str:
     return "I could not map this question to a supported tool. Try one of the ten canonical questions."
 
 
-def narrate(question: str, tool_name: str, tool_result) -> tuple[str, str]:
-    """Returns (answer_text, mode) where mode is 'llm' or 'template'."""
+def narrate(question: str, tool_name: str, tool_result, tool_args: dict | None = None) -> tuple[str, str]:
+    """Returns (answer_text, mode) where mode is 'llm' or 'template'. `tool_args` is the exact,
+    already-resolved arguments the tool was called with (e.g. `{'emirate': 'Ras Al Khaimah'}`) --
+    passed through so the narration can state the scope it was given, not re-guess it from
+    result content (which would be wrong for a legitimately empty result) or leave it out."""
+    tool_args = tool_args or {}
     if _llm_available():
         try:
-            return _llm_narrate(question, tool_name, tool_result), "llm"
+            return _llm_narrate(question, tool_name, tool_result, tool_args), "llm"
         except Exception as exc:  # network/key/package issues -- fall back rather than crash the demo
-            return _template_narrate(question, tool_name, tool_result) + f"\n[LLM call failed, used fallback: {exc}]", "template"
-    return _template_narrate(question, tool_name, tool_result), "template"
+            return _template_narrate(question, tool_name, tool_result, tool_args) + f"\n[LLM call failed, used fallback: {exc}]", "template"
+    return _template_narrate(question, tool_name, tool_result, tool_args), "template"
 
 
 # ---------------------------------------------------------------------------
@@ -301,13 +612,20 @@ def answer_question(question: str, zone_id: str | None = None, quarter: str | No
         return {"question": question, "tool": None, "tool_args": None, "tool_result": None,
                 "answer": "I could not map this question to a supported tool. Try one of the "
                           "ten canonical questions.", "mode": "unmatched"}
+    if tool_name == "clarify":
+        # A metric/typo match was found but confidence was below _CONFIDENCE_THRESHOLD -- ask
+        # rather than guess. No tool ran, so tool_result stays None; the map is untouched (the
+        # frontend only ever moves the map from a tool's own zone_id field(s), and there isn't
+        # one here).
+        return {"question": question, "tool": None, "tool_args": None, "tool_result": None,
+                "answer": f"Did you mean {tool_args['suggestion']}?", "mode": "clarification"}
 
     if quarter and "quarter" in _TOOLS[tool_name].__code__.co_varnames:
         tool_args = {**tool_args, "quarter": quarter}
     tool_args = {k: v for k, v in tool_args.items() if v is not None}
 
     tool_result = _TOOLS[tool_name](**tool_args)
-    answer, mode = narrate(question, tool_name, tool_result)
+    answer, mode = narrate(question, tool_name, tool_result, tool_args)
     return {"question": question, "tool": tool_name, "tool_args": tool_args,
             "tool_result": tool_result, "answer": answer, "mode": mode}
 

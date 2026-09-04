@@ -356,7 +356,6 @@ def render_html(hexagons, width, height, labels, zones_by_quarter, top5_by_quart
           <button onclick="askCopilot('Which 5 areas should we investigate first?')">Which 5 areas should we investigate first?</button>
           <button onclick="askCopilot('Where is experience weakest?')">Where is experience weakest?</button>
           <button onclick="askCopilot('Which areas are deteriorating?')">Which areas are deteriorating?</button>
-          <button onclick="askCopilot('Why is this zone high priority?')">Why is this zone high priority?</button>
         </div>
         <div class="copilot-input-row">
           <input type="text" id="copilot-input" placeholder="Ask a question&hellip;"
@@ -460,6 +459,12 @@ main { display: flex; height: calc(100vh - 190px); min-height: 520px; }
    either direction). Re-appended to the end of its parent in JS on selection so the enlarged
    hex draws on top of (not clipped under) its neighbors. */
 .hex.selected { stroke: var(--accent); stroke-width: 2.2; transform-box: fill-box; transform-origin: center; transform: scale(1.04); }
+/* Copilot result mode has no border/outline styling of its own on purpose -- borders stay the
+   plain, subtle `.hex` default (white, 0.4px) for every zone, Copilot result or not; `.selected`
+   above is still the only thing that gives a zone a stronger border. The Copilot result is
+   communicated entirely through fill color (solid red vs. neutral grey, set directly in JS by
+   renderLayer -- see COPILOT_RESULT_FILL), so it reads as "this zone IS the answer," not as a
+   decoration layered on top of whatever the normal choropleth was already showing. */
 /* Low-confidence tier (10-29 tests): Experience Index is shown at full opacity/color like any
    other scored zone -- the mentor's rule is that it must stay informative on the map, not be
    visually suppressed -- but a dashed border marks it as evidence you can look at, not act on
@@ -473,6 +478,8 @@ main { display: flex; height: calc(100vh - 190px); min-height: 520px; }
 .legend-scale { display: flex; justify-content: space-between; color: var(--text-dim); font-size: 9.5px; }
 .legend-grey { display: flex; align-items: center; gap: 5px; margin-top: 6px; color: var(--text-dim); font-size: 9.5px; }
 .legend-grey-swatch { width: 10px; height: 10px; border-radius: 2px; background: var(--grey-hex); border: 1px solid var(--border); }
+.copilot-clear-btn { display: block; width: 100%; margin-top: 8px; font-size: 10px; font-weight: 700; padding: 5px 0; border-radius: 5px; border: 1px solid var(--accent); background: #fff; color: var(--accent); cursor: pointer; font-family: inherit; }
+.copilot-clear-btn:hover { background: var(--accent); color: #fff; }
 .side-panel { width: 360px; border-left: 1px solid var(--border); background: var(--panel); overflow-y: auto; }
 .panel-block { padding: 14px 16px; border-bottom: 1px solid var(--border); }
 .panel-title { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--text-dim); margin-bottom: 8px; font-weight: 600; }
@@ -530,9 +537,6 @@ footer { padding: 8px 20px; font-size: 10px; color: var(--text-dim); background:
 .copilot-msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 3px; }
 .copilot-msg.assistant { align-self: flex-start; background: var(--bg); color: var(--text); border-bottom-left-radius: 3px; }
 .copilot-msg.error { align-self: flex-start; background: #fdeeee; color: var(--accent-dark); }
-.copilot-zone-chips { display: flex; flex-wrap: wrap; gap: 5px; align-self: flex-start; max-width: 92%; }
-.copilot-zone-chip { font-size: 10px; border: 1px solid var(--border); background: var(--panel); border-radius: 8px; padding: 3px 8px; cursor: pointer; color: var(--text); font-family: inherit; }
-.copilot-zone-chip:hover { border-color: var(--accent); color: var(--accent-dark); }
 .copilot-typing { font-size: 10.5px; color: var(--text-dim); font-style: italic; align-self: flex-start; }
 .copilot-suggestions { display: flex; flex-wrap: wrap; gap: 4px; padding: 7px 11px; border-top: 1px solid var(--border); flex-shrink: 0; }
 .copilot-suggestions button { font-size: 10px; border: 1px solid var(--border); background: var(--bg); border-radius: 11px; padding: 3px 8px; cursor: pointer; color: var(--text-dim); font-family: inherit; }
@@ -551,6 +555,12 @@ let currentLayer = 'experience';
 let currentQuarter = QUARTER_ORDER[QUARTER_ORDER.length - 1];
 let currentEmirate = 'All UAE';
 let selectedZone = null;
+// The H3 ids the last Copilot geographic answer returned -- distinct from `selectedZone` (one
+// zone a user clicked). A non-empty list puts the map in "Copilot result" focus mode: every hex
+// in this set paints solid red, every other hex paints neutral grey, overriding whatever the
+// current layer's normal choropleth would show (see renderLayer). Purely a display-state array
+// read by renderLayer -- never touches ZONES_BY_QUARTER or any computed field.
+let copilotHighlight = [];
 
 function lerp(a, b, t) { return a + (b - a) * t; }
 function lerpColor(c1, c2, t) {
@@ -558,6 +568,13 @@ function lerpColor(c1, c2, t) {
   return `rgb(${Math.round(lerp(r1,r2,t))},${Math.round(lerp(g1,g2,t))},${Math.round(lerp(b1,b2,t))})`;
 }
 const RED = [209,41,61], YELLOW = [255,205,90], GREEN = [26,152,80], GREY = [180,180,186];
+// Copilot result-mode fill colors -- solid red is the exact same red as --accent/RED (never a
+// distinct highlight color), on purpose: the requirement is "this hex IS the Copilot's answer,"
+// not "this hex is decorated to point at the answer." Grey matches the existing "no data" grey
+// used everywhere else on the map, so a non-result zone reads as ordinary background, not as a
+// muted/faded version of its real color.
+const COPILOT_RESULT_FILL = `rgb(${RED.join(',')})`;
+const NEUTRAL_GREY_FILL = '#e3e3e6';
 function rdylgn(t) {
   t = Math.max(0, Math.min(1, t));
   return t < 0.5 ? lerpColor(RED, YELLOW, t / 0.5) : lerpColor(YELLOW, GREEN, (t - 0.5) / 0.5);
@@ -602,6 +619,15 @@ function renderLayer() {
   const cfg = LAYER_CONFIG[currentLayer];
   const zones = currentZones();
   const filterActive = currentEmirate !== 'All UAE';
+  // Copilot result focus mode: `copilotHighlight` (set by setCopilotHighlight, cleared by
+  // clearCopilotHighlight/setQuarter/setEmirate/setLayer/a new Copilot query) temporarily
+  // overrides the normal choropleth entirely -- every hex is either exactly "the Copilot's
+  // answer" (solid red) or "not" (neutral grey), full stop. No layer color, no evidence-tier
+  // dashing, no emirate-filter fade: those are normal-mode concepts and would dilute the one
+  // distinction this mode exists to make unmistakable. `.selected` (stronger border) still
+  // applies independently on top of this -- see the CSS comment above `.hex.selected`.
+  const focusMode = copilotHighlight.length > 0;
+  const highlightSet = focusMode ? new Set(copilotHighlight) : null;
   // Must visit every hexagon physically drawn on the map, not just the ones with a record in
   // `zones` (the current quarter) -- one row is one (h3_cell, quarter) pair, so a hex with no
   // entry here has no valid analytical value THIS quarter, full stop, even if it was colored a
@@ -610,9 +636,14 @@ function renderLayer() {
   // (or a previous layer's) color kept "surviving" a quarter change.
   document.querySelectorAll('.hex').forEach(el => {
     const id = el.id.slice(4); // strip the 'hex-' prefix
+    if (focusMode) {
+      el.style.fill = highlightSet.has(id) ? COPILOT_RESULT_FILL : NEUTRAL_GREY_FILL;
+      el.classList.remove('low-tier'); // evidence-tier dashing is a normal-mode concept only
+      return;
+    }
     const z = zones[id];
     if (!z) {
-      el.style.fill = '#e3e3e6'; // no record for this h3_cell in this quarter -- never inherit an old one
+      el.style.fill = NEUTRAL_GREY_FILL; // no record for this h3_cell in this quarter -- never inherit an old one
       el.classList.remove('low-tier');
       return;
     }
@@ -620,7 +651,7 @@ function renderLayer() {
     // Out-of-filter zones fall back to the same neutral grey as a genuinely unclassified
     // hex (never a faded version of their real color) -- an emirate filter must mean "no
     // other emirate's analytical value is shown," not "shown a little less."
-    el.style.fill = inFilter ? (colorFor(z, currentLayer) || '#e3e3e6') : '#e3e3e6';
+    el.style.fill = inFilter ? (colorFor(z, currentLayer) || NEUTRAL_GREY_FILL) : NEUTRAL_GREY_FILL;
     // Dashed border for 'low' evidence tier (10-29 tests) -- shown, not suppressed, but visibly
     // marked as not shortlist-safe. Only when in-filter, so an out-of-filter zone reads as
     // plain grey like any other hidden zone, not a dashed grey that implies it's still "there."
@@ -630,6 +661,20 @@ function renderLayer() {
 }
 
 function renderLegend(cfg) {
+  // Focus mode replaces the legend entirely rather than adding a note to it -- while
+  // `copilotHighlight` is active the colors on the map are NOT `cfg`'s choropleth (renderLayer
+  // paints red/grey instead), so a legend that still described `cfg`'s gradient would be
+  // describing colors that are not actually on the map right now.
+  if (copilotHighlight.length) {
+    const n = copilotHighlight.length;
+    document.getElementById('legend').innerHTML = `
+      <div class="legend-title">Copilot result</div>
+      <div class="legend-grey"><div class="legend-grey-swatch" style="background:${COPILOT_RESULT_FILL};border-color:${COPILOT_RESULT_FILL}"></div>Copilot's answer (${n} zone${n === 1 ? '' : 's'})</div>
+      <div class="legend-grey" style="margin-top:3px"><div class="legend-grey-swatch"></div>not part of this answer</div>
+      <button class="copilot-clear-btn" onclick="clearCopilotHighlight()">Clear Copilot highlights</button>
+    `;
+    return;
+  }
   const [lo, hi] = DOMAINS[currentLayer];
   let gradientCss;
   if (cfg.kind === 'rdylgn') gradientCss = 'linear-gradient(90deg, rgb(209,41,61), rgb(255,205,90), rgb(26,152,80))';
@@ -680,6 +725,9 @@ function renderKpis() {
 
 function setLayer(layer) {
   currentLayer = layer;
+  // Picking a layer is a request to see that layer's normal colors -- exit Copilot result focus
+  // mode rather than have the just-picked layer silently stay hidden under the red/grey override.
+  copilotHighlight = [];
   document.querySelectorAll('.layer-btn').forEach(b => b.classList.toggle('active', b.dataset.layer === layer));
   renderLayer();
 }
@@ -718,6 +766,7 @@ function refreshSelection() {
 
 function setQuarter(q) {
   currentQuarter = q;
+  copilotHighlight = []; // a Copilot result is scoped to the quarter it was asked about -- exit focus mode
   renderLayer();
   renderKpis();
   renderPriorityList();
@@ -726,6 +775,7 @@ function setQuarter(q) {
 
 function setEmirate(e) {
   currentEmirate = e;
+  copilotHighlight = []; // a Copilot result is scoped to the emirate filter it was asked under -- exit focus mode
   renderLayer();
   renderKpis();
   renderPriorityList();
@@ -919,36 +969,53 @@ function askCopilot(question) {
   sendCopilotQuestion();
 }
 
-// Zone chips are built directly from the tool's own structured result (never parsed out of
-// the narrated prose, which only ever shows a truncated id like "Zone ffffff") -- a listing
-// tool returns an array of zone dicts, a zone-scoped tool (get_zone_details/get_zone_trend/
-// get_zone_peer_comparison) returns one dict with its own zone_id. Either way, every field
-// shown (id, emirate) is exactly what the backend already computed.
-function copilotZoneChips(toolResult) {
-  let zones = [];
-  if (Array.isArray(toolResult)) {
-    zones = toolResult.filter(z => z && z.zone_id).slice(0, 10);
-  } else if (toolResult && typeof toolResult === 'object' && toolResult.zone_id) {
-    zones = [toolResult];
-  }
-  if (!zones.length) return null;
-  const el = document.createElement('div');
-  el.className = 'copilot-zone-chips';
-  el.innerHTML = zones.map(z => {
-    const label = (z.emirate ? z.emirate + ' &middot; ' : '') + shortId(z.zone_id);
-    return `<button class="copilot-zone-chip" onclick="copilotSelectZone('${z.zone_id}')">${label}</button>`;
-  }).join('');
-  return el;
+// Single source of truth for "which zones did this tool result actually name" -- read
+// straight off the tool's own structured JSON, never parsed out of the narrated prose (which
+// only ever shows a truncated id like "Zone ffffff"). A listing tool returns an array of zone
+// dicts; a zone-scoped tool (get_zone_details/get_zone_trend/get_zone_peer_comparison) returns
+// one dict with its own zone_id. Both the zone chips and the map highlight (setCopilotHighlight
+// below) are built from this same extraction, so they can never disagree with each other or
+// with what the tool actually returned.
+function extractZoneRecords(toolResult) {
+  if (Array.isArray(toolResult)) return toolResult.filter(z => z && z.zone_id);
+  if (toolResult && typeof toolResult === 'object' && toolResult.zone_id) return [toolResult];
+  return [];
 }
 
-// Clicking a zone chip reuses the exact same selectZone() the map's own hexagons call --
-// highlights the hex and opens its real evidence in the side panel. No separate "copilot
-// selection" concept, no new map logic.
-function copilotSelectZone(zoneId) {
-  selectZone(zoneId);
+// The tools whose result can name actual H3 zones -- get_coverage_summary/get_methodology
+// return aggregate numbers with no zone_id, and refusal/fixed_fact/unmatched answers have no
+// tool at all, so none of those belong here: per the brief, a non-geographic answer must leave
+// the map exactly as it was, not clear an existing highlight.
+const GEO_TOOLS = new Set([
+  'get_zone_details', 'get_zone_peer_comparison', 'get_zone_trend',
+  'get_top_priority_zones', 'get_priority_zones', 'get_weakest_zones',
+  'get_deteriorating_zones', 'get_anomalous_zones', 'get_high_population_weak_zones',
+  'get_above_median_download_zones', 'get_metric_extreme',
+]);
+
+// Enters Copilot result focus mode on exactly the H3 ids passed in, replacing whatever the
+// previous Copilot answer highlighted -- state only (renderLayer does the actual red/grey
+// painting from `copilotHighlight`, so there is exactly one place that ever sets a hex's fill).
+// Never touches ZONES_BY_QUARTER or any computed Experience/Priority/ML/Confidence field.
+function setCopilotHighlight(ids) {
+  copilotHighlight = ids;
+  renderLayer();
 }
 
-function appendCopilotMessage(role, text, toolResult) {
+// The "Clear Copilot highlights" action -- exits focus mode and restores the currently
+// selected layer's normal choropleth. Also reachable implicitly by changing quarter, emirate,
+// or layer, or by asking a new Copilot geographic question (setCopilotHighlight above); this is
+// the explicit version, wired to the button renderLegend renders while focus mode is active.
+function clearCopilotHighlight() {
+  copilotHighlight = [];
+  renderLayer();
+}
+
+// The Copilot's only two visible outputs are the short narration bubble and the map highlight
+// (setCopilotHighlight, driven separately in sendCopilotQuestion) -- no zone list/chip UI here.
+// Detailed per-zone evidence still lives where it always has: click a highlighted hex (or any
+// hex) and read the existing right-hand zone-detail panel.
+function appendCopilotMessage(role, text) {
   const container = document.getElementById('copilot-messages');
   const wrap = document.createElement('div');
   wrap.style.display = 'flex';
@@ -960,11 +1027,6 @@ function appendCopilotMessage(role, text, toolResult) {
   bubble.className = 'copilot-msg ' + (role === 'user' ? 'user' : role === 'error' ? 'error' : 'assistant');
   bubble.textContent = text;
   wrap.appendChild(bubble);
-
-  if (role === 'assistant') {
-    const chips = copilotZoneChips(toolResult);
-    if (chips) wrap.appendChild(chips);
-  }
 
   container.appendChild(wrap);
   container.scrollTop = container.scrollHeight;
@@ -1004,7 +1066,23 @@ async function sendCopilotQuestion() {
     if (!res.ok) {
       appendCopilotMessage('error', data.message || `The Copilot could not answer that (${data.error || res.status}).`);
     } else {
-      appendCopilotMessage('assistant', data.answer, data.tool_result);
+      // Map-driving step, deliberately separate from narration: only a tool in GEO_TOOLS can
+      // move the map, and only the H3 ids its own structured result named -- the LLM's prose
+      // (`data.answer`) is never consulted here. A non-geographic answer (refusal, fixed_fact,
+      // unmatched, coverage_summary, methodology) leaves the map exactly as it was.
+      if (data.tool && GEO_TOOLS.has(data.tool)) {
+        // Only the priority tools force the layer switch the brief calls out by name ("Which N
+        // areas should we investigate first?" -> Priority layer); other geographic questions
+        // highlight on whichever layer is already showing. This must run BEFORE
+        // setCopilotHighlight -- setLayer exits focus mode (see its own comment), so calling it
+        // after would immediately wipe the highlight this same answer just set.
+        if (data.tool === 'get_top_priority_zones' || data.tool === 'get_priority_zones') {
+          setLayer('priority');
+        }
+        const ids = extractZoneRecords(data.tool_result).map(z => z.zone_id);
+        setCopilotHighlight(ids);
+      }
+      appendCopilotMessage('assistant', data.answer);
     }
   } catch (err) {
     typingEl.remove();
