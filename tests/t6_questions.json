@@ -1,0 +1,88 @@
+{
+  "_comment": "T6 copilot evaluation question bank. Each entry's 'expected' is a machine-checkable SPEC, not a literal value -- tests/test_t6_copilot_evaluation.py resolves the actual expected numbers/zones/rankings fresh from data/processed/zone_priority.parquet every run, so this file never goes stale when the pipeline is re-run. 'zone_role' resolves to a real zone_id picked from the current data at test time (see resolve_zone_role in the test file); 'question' text for locate-area entries names real area_name values already verified present in the processed dataset (see docs/data_dictionary.md), not guessed place names.",
+  "questions": [
+    {"id": "A1", "category": "weak_experience", "kind": "listing_weakest", "question": "Where is experience the weakest?", "params": {"n": 10}},
+    {"id": "A2", "category": "weak_experience", "kind": "listing_weakest", "question": "Show me the areas with the lowest experience.", "params": {"n": 10}},
+    {"id": "A3", "category": "weak_experience", "kind": "listing_weakest", "question": "Which zones are performing worst?", "params": {"n": 10}},
+    {"id": "A4", "category": "weak_experience", "kind": "listing_weakest", "question": "What are the bottom 5 areas by experience?", "params": {"n": 5}},
+    {"id": "A5", "category": "weak_experience", "kind": "listing_weakest", "question": "Which zone has the lowest experience?", "params": {"n": 1}},
+
+    {"id": "B1", "category": "deterioration", "kind": "listing_deteriorating", "question": "Which areas have deteriorated?", "params": {"n": null}},
+    {"id": "B2", "category": "deterioration", "kind": "listing_deteriorating", "question": "Where is experience getting worse?", "params": {"n": null}},
+    {"id": "B3", "category": "deterioration", "kind": "listing_deteriorating", "question": "Which zones declined compared with last quarter?", "params": {"n": null}},
+    {"id": "B4", "category": "deterioration", "kind": "listing_deteriorating", "question": "Show persistent deterioration.", "params": {"n": null}},
+    {"id": "B5", "category": "deterioration", "kind": "listing_deteriorating", "question": "Which area deteriorated the most?", "params": {"n": 1}},
+
+    {"id": "C1", "category": "peer_unusual", "kind": "listing_anomalous", "question": "Which areas behave unusually relative to their peers?", "params": {"kind": "peer_gap"}},
+    {"id": "C2", "category": "peer_unusual", "kind": "listing_anomalous", "question": "Show the biggest peer gaps.", "params": {"kind": "peer_gap"}},
+    {"id": "C3", "category": "peer_unusual", "kind": "listing_anomalous", "question": "Which zones underperform comparable areas?", "params": {"kind": "peer_gap"}},
+    {"id": "C4", "category": "peer_unusual", "kind": "listing_anomalous", "question": "Which areas are anomalous compared to their own history?", "params": {"kind": "temporal"}},
+
+    {"id": "D1", "category": "population_weak", "kind": "listing_high_pop_weak", "question": "Where do weak experience and high population exposure occur together?", "params": {"n": 10}},
+    {"id": "D2", "category": "population_weak", "kind": "listing_high_pop_weak", "question": "Which weak areas affect the most people?", "params": {"n": 10}},
+
+    {"id": "E1", "category": "priority", "kind": "listing_priority", "question": "Which five areas should be investigated first?", "params": {"n": 5}},
+    {"id": "E2", "category": "priority", "kind": "listing_priority", "question": "If I can investigate only three, which three?", "params": {"n": 3}},
+    {"id": "E3", "category": "priority", "kind": "listing_priority", "question": "What is the highest-priority area?", "params": {"n": 1}},
+    {"id": "E4", "category": "priority", "kind": "listing_priority", "question": "Show the top 10 priority zones.", "params": {"n": 10}},
+    {"id": "E5", "category": "priority", "kind": "listing_priority", "question": "Which areas need the highest priority?", "params": {"n": 5}},
+
+    {"id": "F1", "category": "explanation", "kind": "zone_why_priority", "question": "Why was this zone given high priority?", "zone_role": "top_priority"},
+    {"id": "F2", "category": "explanation", "kind": "zone_why_priority", "question": "Why was this zone flagged?", "zone_role": "top_priority"},
+    {"id": "F3", "category": "explanation", "kind": "zone_why_priority", "question": "What factors contribute to its priority?", "zone_role": "top_priority"},
+
+    {"id": "G1", "category": "confidence", "kind": "zone_confidence", "question": "How confident are we in this zone?", "zone_role": "top_priority"},
+    {"id": "G2", "category": "confidence", "kind": "zone_confidence", "question": "Why is confidence low?", "zone_role": "low_tier"},
+    {"id": "G3", "category": "confidence", "kind": "zone_confidence", "question": "Why is confidence high?", "zone_role": "top_priority"},
+    {"id": "G4", "category": "confidence", "kind": "zone_evidence", "question": "Does this area have enough public evidence?", "zone_role": "insufficient_evidence"},
+
+    {"id": "H1", "category": "qoq_change", "kind": "zone_trend", "question": "What changed in this zone versus the previous quarter?", "zone_role": "top_priority"},
+    {"id": "H2", "category": "qoq_change", "kind": "zone_trend_metric", "question": "Did download improve?", "zone_role": "top_priority", "params": {"metric": "download_mbps"}},
+    {"id": "H3", "category": "qoq_change", "kind": "zone_trend_metric", "question": "Did latency deteriorate?", "zone_role": "top_priority", "params": {"metric": "latency_ms"}},
+    {"id": "H4", "category": "qoq_change", "kind": "zone_trend_metric", "question": "Did upload increase?", "zone_role": "top_priority", "params": {"metric": "upload_mbps"}},
+
+    {"id": "I1", "category": "supporting_measurements", "kind": "zone_measurements", "question": "What measurements support this recommendation?", "zone_role": "top_priority"},
+    {"id": "I2", "category": "supporting_measurements", "kind": "zone_raw_metrics", "question": "What are the download, upload, and latency for this zone?", "zone_role": "top_priority"},
+    {"id": "I3", "category": "supporting_measurements", "kind": "zone_raw_metrics", "question": "How many tests and devices support this?", "zone_role": "top_priority"},
+
+    {"id": "J1", "category": "area_lookup", "kind": "locate_area", "question": "Show me Al Mafraq, Abu Dhabi", "params": {"expect_area_name": "Al Mafraq", "expect_emirate": "Abu Dhabi"}, "notes": "Regression: comma-separated 'Area, Emirate' must not collapse to just the emirate."},
+    {"id": "J2", "category": "area_lookup", "kind": "locate_area", "question": "Show me Al Mafraq Abu Dhabi", "params": {"expect_area_name": "Al Mafraq", "expect_emirate": "Abu Dhabi"}, "notes": "Regression: omitted comma."},
+    {"id": "J3", "category": "area_lookup", "kind": "locate_area", "question": "show me al mafraq", "params": {"expect_area_name": "Al Mafraq", "expect_emirate": "Abu Dhabi"}, "notes": "Lowercase, exact name only, no emirate given."},
+    {"id": "J4", "category": "area_lookup", "kind": "locate_area", "question": "SHOW ME AL MAFRAQ", "params": {"expect_area_name": "Al Mafraq", "expect_emirate": "Abu Dhabi"}, "notes": "Different capitalization."},
+    {"id": "J5", "category": "area_lookup", "kind": "locate_area", "question": "What is happening in Al Mafraq?", "params": {"expect_area_name": "Al Mafraq", "expect_emirate": "Abu Dhabi"}, "notes": "'what is happening in ...' query form."},
+    {"id": "J6", "category": "area_lookup", "kind": "locate_area", "question": "Show me Al Furjan", "params": {"expect_area_name": "Al Furjan", "expect_emirate": "Dubai"}},
+    {"id": "J7", "category": "area_lookup", "kind": "locate_area", "question": "Show me Al Mahatta", "params": {"expect_area_name": "Al Mahatta", "expect_emirate": "Sharjah"}},
+    {"id": "J8", "category": "area_lookup", "kind": "locate_area", "question": "Where is Al Bithnah?", "params": {"expect_area_name": "Al Bithnah", "expect_emirate": "Fujairah"}},
+    {"id": "J9", "category": "area_lookup", "kind": "locate_area", "question": "Show me Adhan", "params": {"expect_area_name": "Adhan", "expect_emirate": "Ras Al Khaimah"}},
+    {"id": "J10", "category": "area_lookup", "kind": "locate_area", "question": "Show me Al Haniyah", "params": {"expect_area_name": "Al Haniyah", "expect_emirate": "Ajman"}},
+    {"id": "J11", "category": "area_lookup", "kind": "locate_area", "question": "Show me Al Biyatah", "params": {"expect_area_name": "Al Biyatah", "expect_emirate": "Umm Al Quwain"}},
+    {"id": "J12", "category": "area_lookup", "kind": "locate_area", "question": "Show me muwailah", "params": {"expect_area_name": "Muwaylih", "expect_emirate": "Abu Dhabi"}, "notes": "Typo / transliteration-style respelling."},
+    {"id": "J13", "category": "area_lookup", "kind": "locate_area_ambiguous", "question": "Show me Al Seyouh Suburb", "params": {"expect_area_name": "Al Seyouh Suburb", "expect_emirates": ["Dubai", "Sharjah"]}, "notes": "Real name spanning 2 emirates -- must ask, never guess."},
+
+    {"id": "K1", "category": "filtering", "kind": "listing_metric_threshold", "question": "areas above median download", "params": {"metric": "download_mbps", "comparison": "above"}},
+    {"id": "K2", "category": "filtering", "kind": "listing_metric_threshold", "question": "areas below median download", "params": {"metric": "download_mbps", "comparison": "below"}},
+    {"id": "K3", "category": "filtering", "kind": "listing_metric_threshold", "question": "areas above median upload", "params": {"metric": "upload_mbps", "comparison": "above"}},
+    {"id": "K4", "category": "filtering", "kind": "listing_metric_threshold", "question": "areas below median upload", "params": {"metric": "upload_mbps", "comparison": "below"}},
+    {"id": "K5", "category": "filtering", "kind": "listing_metric_threshold", "question": "areas above median latency", "params": {"metric": "latency_ms", "comparison": "above"}},
+    {"id": "K6", "category": "filtering", "kind": "listing_metric_threshold", "question": "areas below median latency", "params": {"metric": "latency_ms", "comparison": "below"}},
+    {"id": "K7", "category": "filtering", "kind": "listing_metric_threshold", "question": "areas better than median download", "params": {"metric": "download_mbps", "comparison": "above"}, "notes": "Valence word, higher-is-better metric."},
+    {"id": "K8", "category": "filtering", "kind": "listing_metric_threshold", "question": "areas worse than median download", "params": {"metric": "download_mbps", "comparison": "below"}, "notes": "Valence word, higher-is-better metric."},
+    {"id": "K9", "category": "filtering", "kind": "listing_metric_threshold", "question": "areas better than median latency", "params": {"metric": "latency_ms", "comparison": "below"}, "notes": "Valence word, lower-is-better metric -- direction must flip."},
+    {"id": "K10", "category": "filtering", "kind": "listing_metric_threshold", "question": "areas worse than median latency", "params": {"metric": "latency_ms", "comparison": "above"}, "notes": "Valence word, lower-is-better metric -- direction must flip."},
+
+    {"id": "L1", "category": "trap_refusal", "kind": "refusal_trap", "question": "Which e& site is causing this poor experience?", "notes": "MANDATORY trap question from the brief -- the only correct behaviour is a grounded refusal."},
+    {"id": "L2", "category": "trap_refusal", "kind": "data_source_fact", "question": "Is this e& network data?"},
+    {"id": "L3", "category": "trap_refusal", "kind": "refusal_trap", "question": "Which e& tower serves this zone?", "zone_role": "top_priority"},
+    {"id": "L4", "category": "trap_refusal", "kind": "refusal_trap", "question": "Is e& worse than du here?"},
+    {"id": "L5", "category": "trap_refusal", "kind": "refusal_trap", "question": "Which operator has the best network here?"},
+    {"id": "L6", "category": "trap_refusal", "kind": "refusal_trap", "question": "What is the root cause of the poor performance?"},
+    {"id": "L7", "category": "trap_refusal", "kind": "refusal_trap", "question": "Tell me the site ID responsible."},
+    {"id": "L8", "category": "trap_refusal", "kind": "refusal_trap", "question": "Does e& have better coverage than du in this area?"},
+    {"id": "L9", "category": "trap_refusal", "kind": "refusal_trap", "question": "How many customers use this network?"},
+    {"id": "L10", "category": "trap_refusal", "kind": "refusal_trap", "question": "What is the number of customers affected?"},
+    {"id": "L11", "category": "trap_refusal", "kind": "refusal_trap", "question": "Identify the faulty e& site."},
+    {"id": "L12", "category": "trap_refusal", "kind": "refusal_trap", "question": "What network element is failing here?"},
+    {"id": "L13", "category": "trap_refusal", "kind": "unsupported_no_hallucination", "question": "What will experience be next quarter?", "notes": "Forecasting is out of scope -- must not invent a prediction."},
+    {"id": "L14", "category": "trap_refusal", "kind": "unsupported_no_hallucination", "question": "How many people work in this zone during the day?", "notes": "Daytime/commuter population is not in this dataset -- must not invent a number."}
+  ]
+}

@@ -52,13 +52,59 @@ CASES = [
     ("weakest, singular (paraphrase: 'the weakest area')", "Show me the weakest area.", None,
      "get_weakest_zones", {"n": 1, "emirate": None}),
 
-    # --- get_above_median_download_zones ------------------------------------------------------
-    ("above-median download (exact requested wording)", "Which zones have greater than the median download", None,
-     "get_above_median_download_zones", {"emirate": None}),
-    ("above-median download (paraphrase: 'download speed')", "Show zones above the median download speed.", None,
-     "get_above_median_download_zones", {"emirate": None}),
-    ("above-median download (paraphrase, emirate-scoped)", "Which areas in Dubai have above-median download?", None,
-     "get_above_median_download_zones", {"emirate": "Dubai"}),
+    # --- get_strongest_zones -- Experience-ranking intent, 'highest' direction (new) ----------
+    # Same intent as get_weakest_zones above (Experience Index ranking), opposite direction --
+    # one resolver (_resolve_experience_query) handles both, never a route per sentence.
+    ("strongest, plural (canonical)", "where is experience the highest", None,
+     "get_strongest_zones", {"n": 10, "emirate": None}),
+    ("strongest, singular ('which zone... highest')", "which zone has the highest experience", None,
+     "get_strongest_zones", {"n": 1, "emirate": None}),
+    ("strongest, explicit N=5 ('top N ... best experience')", "show me top 5 best experience areas", None,
+     "get_strongest_zones", {"n": 5, "emirate": None}),
+    ("strongest, emirate-scoped, metric typo ('experince')", "highest experince in rak", None,
+     "get_strongest_zones", {"n": 10, "emirate": "Ras Al Khaimah"}),
+    ("strongest, emirate-scoped, metric typo ('experiance')", "best experiance in auh", None,
+     "get_strongest_zones", {"n": 10, "emirate": "Abu Dhabi"}),
+    ("strongest, paraphrase: 'strongest experience'", "which areas have the strongest experience?", None,
+     "get_strongest_zones", {"n": 10, "emirate": None}),
+    ("strongest, paraphrase: 'top experience'", "show the top experience areas", None,
+     "get_strongest_zones", {"n": 10, "emirate": None}),
+
+    # --- get_weakest_zones -- same Experience-ranking intent, explicit 'lowest' direction words
+    # not already covered above (weakest/lowest/worst were already covered without the word
+    # 'experience' present; these add the explicit-'experience' phrasing the same resolver must
+    # also still send to the unchanged get_weakest_zones tool). ------------------------------
+    ("weakest, plural, rephrased ('the weakest')", "where is experience the weakest", None,
+     "get_weakest_zones", {"n": 10, "emirate": None}),
+    ("weakest, emirate-scoped, explicit 'experience'", "worst experience in shj", None,
+     "get_weakest_zones", {"n": 10, "emirate": "Sharjah"}),
+    ("weakest, paraphrase: 'poorest experience'", "which areas have the poorest experience?", None,
+     "get_weakest_zones", {"n": 10, "emirate": None}),
+
+    # --- get_metric_threshold_zones -- one resolver/tool for above/below x download/upload/
+    # latency (previously get_above_median_download_zones: download-only, 'above'-only). -------
+    ("metric-threshold, above download (exact requested wording)", "Which zones have greater than the median download", None,
+     "get_metric_threshold_zones", {"metric": "download_mbps", "comparison": "above", "emirate": None}),
+    ("metric-threshold, above download (paraphrase: 'download speed')", "Show zones above the median download speed.", None,
+     "get_metric_threshold_zones", {"metric": "download_mbps", "comparison": "above", "emirate": None}),
+    ("metric-threshold, above download (paraphrase, emirate-scoped)", "Which areas in Dubai have above-median download?", None,
+     "get_metric_threshold_zones", {"metric": "download_mbps", "comparison": "above", "emirate": "Dubai"}),
+    ("metric-threshold, below download (exact requested wording)", "show me the areas that scored lower than the median download", None,
+     "get_metric_threshold_zones", {"metric": "download_mbps", "comparison": "below", "emirate": None}),
+    ("metric-threshold, above upload", "areas above median upload", None,
+     "get_metric_threshold_zones", {"metric": "upload_mbps", "comparison": "above", "emirate": None}),
+    ("metric-threshold, below upload", "areas below median upload", None,
+     "get_metric_threshold_zones", {"metric": "upload_mbps", "comparison": "below", "emirate": None}),
+    ("metric-threshold, above latency", "areas above median latency", None,
+     "get_metric_threshold_zones", {"metric": "latency_ms", "comparison": "above", "emirate": None}),
+    ("metric-threshold, below latency", "areas below median latency", None,
+     "get_metric_threshold_zones", {"metric": "latency_ms", "comparison": "below", "emirate": None}),
+    ("metric-threshold, typo ('downlod')", "below median downlod", None,
+     "get_metric_threshold_zones", {"metric": "download_mbps", "comparison": "below", "emirate": None}),
+    ("metric-threshold, paraphrase ('under')", "areas under median upload", None,
+     "get_metric_threshold_zones", {"metric": "upload_mbps", "comparison": "below", "emirate": None}),
+    ("metric-threshold, typo ('medain')", "latency greater than the medain", None,
+     "get_metric_threshold_zones", {"metric": "latency_ms", "comparison": "above", "emirate": None}),
 
     # --- get_deteriorating_zones -------------------------------------------------------------
     ("deteriorating (canonical, no N -> unchanged 'all flagged' default)", "Which areas are deteriorating?", None,
@@ -218,8 +264,8 @@ def _latest_classified() -> pd.DataFrame:
 def test_median_download_question_matches_independent_recomputation():
     """'Which zones have greater than the median download' -- previously unmatched entirely."""
     result = copilot.answer_question("Which zones have greater than the median download")
-    assert result["tool"] == "get_above_median_download_zones", result["tool"]
-    assert result["tool_args"] == {}, result["tool_args"]
+    assert result["tool"] == "get_metric_threshold_zones", result["tool"]
+    assert result["tool_args"] == {"metric": "download_mbps", "comparison": "above"}, result["tool_args"]
     tool_result = result["tool_result"]
     highlighted = _highlighted_ids(tool_result)
     assert len(highlighted) == len(set(highlighted)), "duplicate zone_id in tool_result"
@@ -234,6 +280,119 @@ def test_median_download_question_matches_independent_recomputation():
     )
     print(f"'Which zones have greater than the median download' -> {len(tool_result)} zones "
           f"(median {median_download:.2f} Mbps), exactly matches independent recomputation.")
+
+
+# --- Metric-threshold intent, both directions x all 3 raw metrics (new capability): "show me
+# the areas that scored higher/lower than the median download/upload/latency" -- previously only
+# 'download'+'above' was wired up at all ('below' silently fell through to the median-VALUE
+# question and answered only the number). One resolver/tool now covers both directions for all
+# three raw metrics -- these prove each combination routes correctly, is scoped/filtered by the
+# deterministic backend (never the LLM), and matches an independent recomputation of the median
+# and the filtered set from the raw parquet data. --------------------------------------------
+
+METRIC_THRESHOLD_EXAMPLE_QUESTIONS = [
+    # (question, metric, comparison, dataframe column the metric actually reads)
+    ("show me the areas that scored higher than the median download", "download_mbps", "above", "download_mbps"),
+    ("show me the areas that scored lower than the median download", "download_mbps", "below", "download_mbps"),
+    ("areas above median upload", "upload_mbps", "above", "upload_mbps"),
+    ("areas below median upload", "upload_mbps", "below", "upload_mbps"),
+    ("areas above median latency", "latency_ms", "above", "latency_effective_ms"),
+    ("areas below median latency", "latency_ms", "below", "latency_effective_ms"),
+]
+
+
+def test_metric_threshold_examples_route_and_match_independent_recomputation():
+    """The exact regression set requested for this fix. Each of the 6 (metric x direction)
+    combinations checked end to end: correct tool/metric/comparison resolved from text alone,
+    the returned zones exactly equal an independent recomputation of 'value > median' or
+    'value < median' over the raw parquet data (never just 'some zones of the right shape'),
+    and the map highlight (extractZoneRecords/setCopilotHighlight in build_dashboard.py) is
+    exactly the tool's own zone_id set, in order."""
+    classified = _latest_classified()
+    for question, metric, comparison, col in METRIC_THRESHOLD_EXAMPLE_QUESTIONS:
+        result = copilot.answer_question(question)
+        assert result["tool"] == "get_metric_threshold_zones", f"{question!r}: tool {result['tool']!r}"
+        assert result["tool_args"].get("metric") == metric, (
+            f"{question!r}: metric {result['tool_args'].get('metric')!r}, expected {metric!r}"
+        )
+        assert result["tool_args"].get("comparison") == comparison, (
+            f"{question!r}: comparison {result['tool_args'].get('comparison')!r}, expected {comparison!r}"
+        )
+        tool_result = result["tool_result"]
+        assert tool_result, f"{question!r}: expected at least one zone"
+        highlighted = _highlighted_ids(tool_result)
+        assert len(highlighted) == len(set(highlighted)), f"{question!r}: duplicate zone_id in tool_result"
+        assert highlighted == [z["zone_id"] for z in tool_result], (
+            f"{question!r}: highlighted ids must exactly equal tool_result's own zone_id order"
+        )
+
+        median_value = round(float(classified[col].median()), 2)
+        if comparison == "above":
+            expected_ids = set(classified.loc[classified[col] > median_value, "h3_cell"])
+        else:
+            expected_ids = set(classified.loc[classified[col] < median_value, "h3_cell"])
+        assert set(highlighted) == expected_ids, (
+            f"{question!r}: {len(set(highlighted) ^ expected_ids)} zone(s) differ from the "
+            f"independently recomputed '{comparison} median {metric}' set"
+        )
+        print(f"{question!r} -> {result['tool']}, {len(tool_result)} zone(s) (median {median_value}), "
+              f"exactly matches independent recomputation.")
+
+
+def test_above_and_below_median_download_return_disjoint_opposite_sets():
+    """'higher than the median download' and 'lower than the median download' must return
+    disjoint sets that, together with any zones exactly AT the median, account for the entire
+    classified population -- the exact regression this fix targets: 'below' used to silently
+    fall through to the median-VALUE question and never return a zone list at all."""
+    classified = _latest_classified()
+    above = copilot.answer_question("show me the areas that scored higher than the median download")
+    below = copilot.answer_question("show me the areas that scored lower than the median download")
+    assert above["tool"] == "get_metric_threshold_zones", above["tool"]
+    assert below["tool"] == "get_metric_threshold_zones", below["tool"]
+    assert above["tool_args"]["comparison"] == "above", above["tool_args"]
+    assert below["tool_args"]["comparison"] == "below", below["tool_args"]
+
+    above_ids = set(_highlighted_ids(above["tool_result"]))
+    below_ids = set(_highlighted_ids(below["tool_result"]))
+    assert above_ids, "expected at least one zone above the median"
+    assert below_ids, "expected at least one zone below the median"
+    assert not (above_ids & below_ids), f"above/below sets must never overlap: {above_ids & below_ids}"
+
+    median_download = round(float(classified["download_mbps"].median()), 2)
+    at_median = int((classified["download_mbps"] == median_download).sum())
+    assert len(above_ids) + len(below_ids) + at_median == len(classified), (
+        "above + below + exactly-at-median must account for every classified zone"
+    )
+    print(f"'higher than median download' -> {len(above_ids)} zones, 'lower than median download' -> "
+          f"{len(below_ids)} zones, {at_median} exactly at the median ({median_download} Mbps) -- "
+          f"disjoint, sums to the full classified population ({len(classified)} zones).")
+
+
+def test_below_median_narration_matches_exact_requested_wording():
+    """Regression guard for the exact short-answer wording requested: 'These are the areas with
+    download speeds below the median for <quarter>. I highlighted them on the map.'"""
+    result = copilot.answer_question("show me the areas that scored lower than the median download")
+    quarter = result["tool_result"][0]["quarter"]
+    assert result["answer"] == (
+        f"These are the areas with download speeds below the median for {quarter}. "
+        f"I highlighted them on the map."
+    ), result["answer"]
+    print(f"Narration matches exactly: {result['answer']!r}")
+
+
+def test_median_value_question_never_highlights_zones():
+    """'What is the median download?' must return the number only -- get_metric_extreme with
+    zone_id=None (the backend equivalent of 'nothing highlighted': build_dashboard.py's
+    GEO_TOOLS/extractZoneRecords only ever highlight a real zone_id, and get_metric_extreme's
+    own docstring is explicit that 'median' has no single zone that IS the median)."""
+    result = copilot.answer_question("what is the median download")
+    assert result["tool"] == "get_metric_extreme", result["tool"]
+    assert result["tool_args"] == {"metric": "download_mbps", "operation": "median"}, result["tool_args"]
+    assert result["tool_result"]["zone_id"] is None, "a median-VALUE question must never name a zone to highlight"
+    expected_median = round(float(_latest_classified()["download_mbps"].median()), 2)
+    assert result["tool_result"]["value"] == expected_median
+    print(f"'what is the median download' -> value {result['tool_result']['value']} Mbps, "
+          f"zone_id=None (nothing highlighted), matches independent recomputation.")
 
 
 def test_lowest_experience_question_returns_exactly_one_zone():
@@ -286,6 +445,133 @@ def test_top_n_deterioration_question_returns_exactly_n_strongest():
     expected_total = int(_latest_classified()["deteriorating"].sum())
     assert len(result["tool_result"]) == expected_total
     print(f"'Which areas are deteriorating?' (no N) -> all {expected_total} flagged zones, default unchanged.")
+
+
+# --- Experience-ranking, 'highest' direction (new capability): "where is experience the
+# highest" used to be entirely unmatched (only 'lowest'/'weakest'/'worst' routed anywhere), even
+# though "where is experience the weakest" already worked. These prove both directions now share
+# one structured intent (metric=experience, direction=highest|lowest), the returned zones are
+# actually sorted by Experience Index in the requested direction (never just "some N zones of
+# the right shape"), and the map highlights exactly the tool's own zone_id set. -----------------
+
+def test_highest_experience_question_returns_exactly_one_zone():
+    """'Which zone has the highest experience' -- mirrors the existing lowest/singular
+    regression test above, opposite direction. Must return, and highlight, exactly the one true
+    maximum -- not a top-10 list."""
+    result = copilot.answer_question("Which zone has the highest experience")
+    assert result["tool"] == "get_strongest_zones", result["tool"]
+    assert result["tool_args"] == {"n": 1}, result["tool_args"]
+    tool_result = result["tool_result"]
+    assert len(tool_result) == 1, f"expected exactly 1 zone, got {len(tool_result)}"
+    highlighted = _highlighted_ids(tool_result)
+
+    classified = _latest_classified()
+    expected_id = classified.loc[classified["experience_index"].idxmax(), "h3_cell"]
+    assert highlighted == [expected_id], f"got {highlighted}, expected the true maximum [{expected_id!r}]"
+    print("'Which zone has the highest experience' -> exactly 1 zone highlighted, "
+          "matches the true maximum Experience Index in the data.")
+
+
+def test_experience_ranking_both_directions_sorted_and_highlighted_correctly():
+    """'where is experience the highest' / 'where is experience the weakest' -- the map must
+    highlight exactly the tool's own zone_id set, in the tool's own order (never reparsed from
+    narration), and that order must be true Experience Index rank, independently recomputed from
+    the raw data. Also proves the two directions don't secretly share a sort order (they'd
+    overlap entirely at n=10 if 'highest' silently reused 'lowest''s ascending sort)."""
+    classified = _latest_classified()
+
+    highest = copilot.answer_question("where is experience the highest")
+    assert highest["tool"] == "get_strongest_zones", highest["tool"]
+    assert len(highest["tool_result"]) == 10
+    highlighted_highest = _highlighted_ids(highest["tool_result"])
+    expected_highest = classified.sort_values("experience_index", ascending=False).head(10)["h3_cell"].tolist()
+    assert highlighted_highest == expected_highest, (highlighted_highest, expected_highest)
+    highest_values = [z["experience_index"] for z in highest["tool_result"]]
+    assert highest_values == sorted(highest_values, reverse=True), "highest-direction result not sorted descending"
+
+    weakest = copilot.answer_question("where is experience the weakest")
+    assert weakest["tool"] == "get_weakest_zones", weakest["tool"]
+    assert len(weakest["tool_result"]) == 10
+    highlighted_weakest = _highlighted_ids(weakest["tool_result"])
+    expected_weakest = classified.sort_values("experience_index", ascending=True).head(10)["h3_cell"].tolist()
+    assert highlighted_weakest == expected_weakest, (highlighted_weakest, expected_weakest)
+    weakest_values = [z["experience_index"] for z in weakest["tool_result"]]
+    assert weakest_values == sorted(weakest_values), "lowest-direction result not sorted ascending"
+
+    assert not (set(highlighted_highest) & set(highlighted_weakest)), (
+        "highest and weakest result sets overlap -- direction not actually applied"
+    )
+    print(f"'where is experience the highest' -> {len(highest['tool_result'])} zones, sorted "
+          f"descending, matches independent recomputation. 'where is experience the weakest' -> "
+          f"{len(weakest['tool_result'])} zones, sorted ascending, matches independent "
+          f"recomputation. No overlap between the two extremes.")
+
+
+def test_strongest_listing_narration_matches_exact_requested_wording():
+    """Regression guard for the exact short-answer wording requested: 10 areas, no emirate ->
+    'These are the 10 areas with the highest measured mobile experience in <quarter>. I
+    highlighted them on the map.'"""
+    result = copilot.answer_question("where is experience the highest")
+    quarter = result["tool_result"][0]["quarter"]
+    assert result["answer"] == (
+        f"These are the 10 areas with the highest measured mobile experience in {quarter}. "
+        f"I highlighted them on the map."
+    ), result["answer"]
+    print(f"Narration matches exactly: {result['answer']!r}")
+
+
+EXPERIENCE_DIRECTION_EXAMPLE_QUESTIONS = [
+    # (question, expected_direction, expected_emirate) -- the exact regression set requested,
+    # covering both directions, a metric typo, and emirate scoping.
+    ("where is experience the highest", "highest", None),
+    ("which zone has the highest experience", "highest", None),
+    ("show me top 5 best experience areas", "highest", None),
+    ("highest experince in rak", "highest", "Ras Al Khaimah"),
+    ("best experiance in auh", "highest", "Abu Dhabi"),
+    ("where is experience the weakest", "lowest", None),
+    ("worst experience in shj", "lowest", "Sharjah"),
+]
+
+
+def test_experience_direction_examples_route_scope_and_sort_correctly():
+    """The exact 7 regression questions requested for this fix, checked end to end: correct
+    tool, correct emirate confinement (deterministic filtering, never LLM-narrated around an
+    unfiltered result), Experience Index actually sorted in the requested direction, and the map
+    highlight exactly equal to the tool's own returned zone_id order."""
+    for question, direction, expected_emirate in EXPERIENCE_DIRECTION_EXAMPLE_QUESTIONS:
+        expected_tool = "get_strongest_zones" if direction == "highest" else "get_weakest_zones"
+        result = copilot.answer_question(question)
+        assert result["tool"] == expected_tool, f"{question!r}: tool {result['tool']!r}, expected {expected_tool!r}"
+        assert result["tool_args"].get("emirate") == expected_emirate, (
+            f"{question!r}: emirate {result['tool_args'].get('emirate')!r}, expected {expected_emirate!r}"
+        )
+        tool_result = result["tool_result"]
+        assert tool_result, f"{question!r}: expected at least one zone"
+        if expected_emirate:
+            wrong_emirate = [z for z in tool_result if z["emirate"] != expected_emirate]
+            assert not wrong_emirate, f"{question!r}: zone(s) outside {expected_emirate}: {wrong_emirate}"
+
+        exp_values = [z["experience_index"] for z in tool_result]
+        expected_sorted = sorted(exp_values, reverse=(direction == "highest"))
+        assert exp_values == expected_sorted, f"{question!r}: not sorted {direction} ({exp_values})"
+
+        highlighted = _highlighted_ids(tool_result)
+        assert highlighted == [z["zone_id"] for z in tool_result], (
+            f"{question!r}: highlighted ids must exactly equal tool_result's own zone_id order"
+        )
+        print(f"{question!r} -> {expected_tool}, direction={direction}, emirate={expected_emirate}, "
+              f"{len(tool_result)} zone(s), sorted correctly, map highlight matches exactly.")
+
+
+def test_experience_question_without_direction_asks_for_clarification():
+    """'experience' alone, with no direction word at all, must ask -- never silently default to
+    one direction. Same clarification contract test_low_confidence_metric_typo_... already
+    proves for the raw-metric resolver, applied here to the Experience-ranking resolver."""
+    result = copilot.answer_question("tell me about experience")
+    assert result["tool"] is None, result["tool"]
+    assert result["mode"] == "clarification", result["mode"]
+    assert "experience" in result["answer"].lower()
+    print(f"No-direction experience question -> mode=clarification, answer={result['answer']!r}")
 
 
 # --- Emirate alias resolution: "which zones has worst experience in rak" used to be answered
@@ -483,7 +769,7 @@ def test_median_download_listing_and_median_value_questions_stay_distinguished()
     and 'download' -- the comparison word ('greater than') is what tells them apart, and this
     must keep working after adding metric-extreme median support."""
     listing = copilot.answer_question("Which zones have greater than the median download")
-    assert listing["tool"] == "get_above_median_download_zones", listing["tool"]
+    assert listing["tool"] == "get_metric_threshold_zones", listing["tool"]
     assert isinstance(listing["tool_result"], list) and len(listing["tool_result"]) > 1
 
     value = copilot.answer_question("what is the median download speed")
@@ -492,7 +778,7 @@ def test_median_download_listing_and_median_value_questions_stay_distinguished()
     assert isinstance(value["tool_result"], dict) and value["tool_result"]["zone_id"] is None
     expected_median = round(float(_latest_classified()["download_mbps"].median()), 2)
     assert value["tool_result"]["value"] == expected_median
-    print(f"Listing question -> {len(listing['tool_result'])} zones (get_above_median_download_zones). "
+    print(f"Listing question -> {len(listing['tool_result'])} zones (get_metric_threshold_zones). "
           f"Value question -> single value {value['tool_result']['value']} Mbps (get_metric_extreme), "
           f"no zone_id -- correctly distinguished.")
 
@@ -518,8 +804,17 @@ if __name__ == "__main__":
     test_refusal_and_fixed_fact_questions_route_to_no_tool()
     test_geographic_answers_avoid_internal_jargon()
     test_median_download_question_matches_independent_recomputation()
+    test_metric_threshold_examples_route_and_match_independent_recomputation()
+    test_above_and_below_median_download_return_disjoint_opposite_sets()
+    test_below_median_narration_matches_exact_requested_wording()
+    test_median_value_question_never_highlights_zones()
     test_lowest_experience_question_returns_exactly_one_zone()
     test_top_n_deterioration_question_returns_exactly_n_strongest()
+    test_highest_experience_question_returns_exactly_one_zone()
+    test_experience_ranking_both_directions_sorted_and_highlighted_correctly()
+    test_strongest_listing_narration_matches_exact_requested_wording()
+    test_experience_direction_examples_route_scope_and_sort_correctly()
+    test_experience_question_without_direction_asks_for_clarification()
     test_emirate_alias_table_matches_the_required_list()
     test_every_required_alias_resolves_case_and_hyphen_insensitively()
     test_short_emirate_codes_do_not_false_positive_inside_unrelated_words()

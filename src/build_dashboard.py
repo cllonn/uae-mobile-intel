@@ -162,6 +162,7 @@ def build_zone_data(priority_path: Path, population_path: Path):
         lat, lon = cell_centers[row["h3_cell"]]
         return {
             "emirate": row["emirate"],
+            "area_name": row["area_name"],
             "peer_group": row["peer_group"],
             "evidence_tier": row["evidence_tier"],  # 'low' or 'full' here -- 'insufficient' zones never reach this dict at all
             "experience_index": _num(row["experience_index"]),
@@ -238,6 +239,20 @@ def build_zone_data(priority_path: Path, population_path: Path):
     for emirate in EMIRATES:
         population_by_emirate[emirate] = int(pop_by_emirate.loc[pop_by_emirate["emirate"] == emirate, "population"].sum())
 
+    # Area name for every hex that's part of the "measured or populated" universe (scripts/
+    # build_area_name_field.py), not just currently-classified ones -- so a hex a user clicks
+    # with no data THIS quarter (or ever) can still show its real place name instead of a raw
+    # H3 fragment, in the "no classification this quarter" panel. A hex outside that universe
+    # entirely (uninhabited desert/marine cells the map still draws to fill the boundary) has no
+    # entry here; the frontend falls back to a plain, honest "Unnamed area" with no invented name.
+    area_names_df = pd.read_parquet("data/processed/area_names_uae.parquet").merge(
+        emirate_zones, on="h3_cell", how="left"
+    )
+    area_names_by_cell = {
+        row["h3_cell"]: {"area_name": row["area_name"], "emirate": row["emirate"]}
+        for _, row in area_names_df.iterrows()
+    }
+
     trend_abs = classified_all["trend_pts_per_qtr"].dropna().abs()
     domains = {
         "experience": [0, 100],
@@ -246,11 +261,11 @@ def build_zone_data(priority_path: Path, population_path: Path):
         "trend": [round(float(-trend_abs.quantile(0.95)), 1), round(float(trend_abs.quantile(0.95)), 1)],
     }
 
-    return zones_by_quarter, top5_by_quarter, kpis_by_quarter, domains, population_by_emirate
+    return zones_by_quarter, top5_by_quarter, kpis_by_quarter, domains, population_by_emirate, area_names_by_cell
 
 
 def render_html(hexagons, width, height, labels, zones_by_quarter, top5_by_quarter,
-                 kpis_by_quarter, domains, population_by_emirate,
+                 kpis_by_quarter, domains, population_by_emirate, area_names_by_cell,
                  build_id, data_path, data_mtime) -> str:
     """Assembles the full self-contained HTML page: CSS for layout/theme, embedded JSON for
     the hex grid + per-quarter zone data, and vanilla JS for layer/quarter/emirate switching
@@ -294,7 +309,15 @@ def render_html(hexagons, width, height, labels, zones_by_quarter, top5_by_quart
 
 <header>
   <div class="title-block">
-    <h1>UAE Mobile Network Experience Intelligence</h1>
+    <div class="title-row">
+      <h1>UAE Mobile Network Experience Intelligence</h1>
+      <div class="powered-by">
+        <span>Powered by</span>
+        <svg class="brand-mark" viewBox="61.88 83.59 530.26 358.24" role="img" aria-label="e&amp; logo">
+          <path fill="#ee0a1a" d="M 191.621094 441.765625 C 229.566406 441.765625 258.28125 428.007812 278.144531 408.582031 C 298.394531 429.167969 328.757812 441.824219 365.914062 441.824219 C 411.730469 441.824219 448.933594 423.683594 477.554688 395.535156 L 514.296875 435.601562 L 591.980469 435.601562 L 512.3125 349.40625 C 530.53125 317.082031 541.90625 281.359375 545.726562 244.449219 L 488.476562 244.449219 C 487.21875 266.453125 482.714844 288.148438 475.117188 308.832031 C 468.355469 327.605469 458.34375 345.046875 445.542969 360.355469 C 426.941406 381.816406 403.105469 395.65625 375.890625 395.65625 C 343.773438 395.65625 321.730469 381.898438 313.363281 358.886719 L 252.152344 358.886719 C 242.136719 382.746094 218.773438 394.675781 189.199219 394.675781 C 156.742188 394.675781 123.339844 371.300781 119.546875 323.585938 L 311.011719 323.585938 C 315.90625 300.113281 334.484375 282.503906 364.507812 271.144531 C 364.507812 271.144531 392.277344 260.898438 419.855469 249.113281 C 458.019531 231.480469 486.636719 199.992188 486.636719 159.890625 C 486.636719 103.125 437.984375 83.589844 394.09375 83.589844 C 338.746094 83.589844 297.777344 112.683594 297.777344 158.96875 C 297.777344 186.148438 312.585938 211.90625 334.519531 237.667969 C 322.964844 241.738281 311.890625 247.0625 301.492188 253.546875 C 283.824219 204.8125 243.15625 173.226562 187.832031 173.226562 C 114.824219 173.226562 61.875 228.089844 61.875 305.308594 C 61.875 382.53125 109.109375 441.753906 191.632812 441.753906 L 191.621094 441.753906 Z M 394.496094 126.695312 L 394.496094 126.5 C 415.472656 126.5 432.644531 138.417969 432.644531 161.804688 C 432.644531 183.265625 419.769531 204.265625 390.667969 217.152344 L 390.207031 216.65625 C 373.011719 198.511719 356.792969 177.550781 356.792969 157.515625 C 356.792969 137.484375 374.4375 126.695312 394.496094 126.695312 Z M 187.757812 217.671875 L 187.757812 217.5625 C 221.148438 217.5625 251.707031 241.917969 253.132812 281.996094 L 119.535156 281.996094 C 124.296875 233.441406 161.042969 217.671875 187.757812 217.671875 Z"/>
+        </svg>
+      </div>
+    </div>
     <div class="subtitle">Outside-in public mobile-experience intelligence &middot; Mobile only &middot; Not e&amp; network data</div>
   </div>
   <div class="header-controls">
@@ -348,7 +371,7 @@ def render_html(hexagons, width, height, labels, zones_by_quarter, top5_by_quart
       </div>
       <div class="copilot-body" id="copilot-body">
         <div class="copilot-messages" id="copilot-messages">
-          <div class="copilot-msg assistant">Ask about UAE public mobile experience &mdash; weakest zones,
+          <div class="copilot-msg assistant">Ask about UAE public mobile experience &ndash; weakest zones,
             priorities, deterioration, anomalies, or the zone currently selected on the map. Every number in
             an answer comes from the computed pipeline, never invented.</div>
         </div>
@@ -392,6 +415,7 @@ const TOP5_BY_QUARTER = {json.dumps(top5_by_quarter)};
 const KPIS_BY_QUARTER = {json.dumps(kpis_by_quarter)};
 const DOMAINS = {json.dumps(domains)};
 const POPULATION_BY_EMIRATE = {json.dumps(population_by_emirate)};
+const AREA_NAMES_BY_CELL = {json.dumps(area_names_by_cell)};
 const BUILD_ID = {json.dumps(build_id)};
 const DATA_PATH = {json.dumps(data_path)};
 const DATA_MTIME = {json.dumps(data_mtime)};
@@ -429,6 +453,9 @@ _CSS = """
 body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif; font-size: 14px; }
 header { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; gap: 10px; }
 h1 { font-size: 17px; margin: 0; letter-spacing: 0.2px; }
+.title-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.powered-by { display: flex; align-items: center; gap: 5px; font-size: 9.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.4px; padding: 2px 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg); }
+.brand-mark { flex-shrink: 0; width: 26px; height: auto; display: block; }
 .subtitle { font-size: 10.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
 .header-controls { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 .select-group { display: flex; flex-direction: column; gap: 2px; }
@@ -685,8 +712,7 @@ function renderLegend(cfg) {
     <div class="legend-gradient" style="background:${gradientCss}"></div>
     <div class="legend-scale"><span>${lo}</span><span>${hi}</span></div>
     <div class="legend-scale" style="margin-top:4px">${cfg.hint}</div>
-    <div class="legend-grey"><div class="legend-grey-swatch"></div>insufficient public evidence &mdash; not classified</div>
-    <div class="legend-grey" style="margin-top:3px"><div class="legend-grey-swatch" style="background:#fff;border-style:dashed"></div>dashed border: low confidence (10&ndash;29 tests) &mdash; not shortlist-eligible</div>
+    <div class="legend-grey"><div class="legend-grey-swatch"></div>insufficient public evidence - not classified or low confidence</div>
   `;
 }
 
@@ -797,9 +823,18 @@ function sparklineSvg(values) {
   </svg>`;
 }
 
-function shortId(id) {
-  const trimmed = id.replace(/f+$/, '');
-  return trimmed.slice(-6);
+// User-facing area label -- real OSM-derived place name (scripts/build_area_name_field.py),
+// never the raw H3 id. Prefers the per-quarter record's own area_name/emirate (present for any
+// currently-classified zone); falls back to AREA_NAMES_BY_CELL, which covers every hex in the
+// "measured or populated" universe regardless of this quarter's classification, so even a "no
+// classification this quarter" hex still shows its real place name. A hex outside that universe
+// entirely (uninhabited desert/marine filler cells) gets a plain, honest "Unnamed area" -- the
+// H3 id itself is still shown separately (zd-region) for anyone who needs it for traceability.
+function areaLabel(id, z) {
+  if (z && z.area_name) return z.emirate ? `${z.area_name}, ${z.emirate}` : z.area_name;
+  const known = AREA_NAMES_BY_CELL[id];
+  if (known) return known.emirate ? `${known.area_name}, ${known.emirate}` : known.area_name;
+  return 'Unnamed area';
 }
 
 function factorRow(label, band) {
@@ -833,16 +868,16 @@ function selectZone(id) {
   const panel = document.getElementById('zone-detail');
   if (!z) {
     panel.innerHTML = outOfFilter ? `
-      <div class="zd-region">H3 zone &middot; ${id}</div>
-      <div class="zd-name">Outside the current emirate filter</div>
+      <div class="zd-region">Hexagon ID ${id}</div>
+      <div class="zd-name">${areaLabel(id, raw)}</div>
       <div class="insufficient-msg">
-        This hexagon belongs to ${raw.emirate}, not ${currentEmirate}. Switch the Emirate filter
+        This area belongs to ${raw.emirate}, not ${currentEmirate}. Switch the Emirate filter
         to ${raw.emirate} (or "All UAE") to see its data.
       </div>` : `
-      <div class="zd-region">H3 zone &middot; ${id}</div>
-      <div class="zd-name">No classification this quarter</div>
+      <div class="zd-region">Hexagon ID ${id}</div>
+      <div class="zd-name">${areaLabel(id, null)}</div>
       <div class="insufficient-msg">
-        This hexagon has too few public Ookla measurements this quarter to compute a reliable
+        This area has too few public Ookla measurements this quarter to compute a reliable
         Experience Index -- shown as "insufficient public evidence," not treated as poor
         performance. It may still have data in other quarters.
       </div>`;
@@ -863,19 +898,19 @@ function selectZone(id) {
     </div>
     <div class="insufficient-msg" style="margin-bottom:10px">
       Low-confidence evidence (10&ndash;29 tests): Experience Index is shown, but this zone is
-      <strong>not eligible for the Priority shortlist</strong> &mdash; informative, not a safe
+      <strong>not eligible for the Priority shortlist</strong> &ndash; informative, not a safe
       recommendation.
     </div>`;
   const factorBlock = isFull ? `
-    <div class="panel-title">Why this priority &mdash; factor contributions</div>
+    <div class="panel-title">Why this priority &ndash; factor contributions</div>
     ${factorRow('Experience gap vs. peers', z.bands.peer_gap)}
     ${factorRow('Temporal anomaly (vs. own history)', z.bands.temporal_anomaly)}
     ${factorRow('Deterioration', z.bands.deterioration)}
     ${factorRow('Population exposure', z.bands.population)}` : '';
 
   panel.innerHTML = `
-    <div class="zd-region">${z.emirate} &middot; H3 ${id} &middot; ${currentQuarter}</div>
-    <div class="zd-name">Zone ${shortId(id)}</div>
+    <div class="zd-region">Hexagon ID ${id} &middot; ${currentQuarter}</div>
+    <div class="zd-name">${areaLabel(id, z)}</div>
     <div class="zd-tags">
       <span class="tag">Peer: ${z.peer_group}</span>
       ${!isFull ? '<span class="tag">Low confidence</span>' : ''}
@@ -939,7 +974,7 @@ function renderPriorityList() {
     return `<li class="priority-item" data-id="${id}" onclick="selectZone('${id}')">
       <div class="priority-rank">${i + 1}</div>
       <div class="priority-info">
-        <div class="priority-name">${z.emirate} &middot; ${shortId(id)}</div>
+        <div class="priority-name">${areaLabel(id, z)}</div>
         <div class="priority-meta">${z.peer_group} &middot; Exp ${z.experience_index} &middot; Conf ${z.confidence_score}%</div>
       </div>
       <div class="priority-score">P${Math.round(z.priority_score)}</div>
@@ -971,7 +1006,7 @@ function askCopilot(question) {
 
 // Single source of truth for "which zones did this tool result actually name" -- read
 // straight off the tool's own structured JSON, never parsed out of the narrated prose (which
-// only ever shows a truncated id like "Zone ffffff"). A listing tool returns an array of zone
+// only ever names an area by its real place name, never a raw H3 id). A listing tool returns an array of zone
 // dicts; a zone-scoped tool (get_zone_details/get_zone_trend/get_zone_peer_comparison) returns
 // one dict with its own zone_id. Both the zone chips and the map highlight (setCopilotHighlight
 // below) are built from this same extraction, so they can never disagree with each other or
@@ -988,9 +1023,9 @@ function extractZoneRecords(toolResult) {
 // the map exactly as it was, not clear an existing highlight.
 const GEO_TOOLS = new Set([
   'get_zone_details', 'get_zone_peer_comparison', 'get_zone_trend',
-  'get_top_priority_zones', 'get_priority_zones', 'get_weakest_zones',
+  'get_top_priority_zones', 'get_priority_zones', 'get_weakest_zones', 'get_strongest_zones',
   'get_deteriorating_zones', 'get_anomalous_zones', 'get_high_population_weak_zones',
-  'get_above_median_download_zones', 'get_metric_extreme',
+  'get_metric_threshold_zones', 'get_metric_extreme', 'locate_area',
 ]);
 
 // Enters Copilot result focus mode on exactly the H3 ids passed in, replacing whatever the
@@ -1109,7 +1144,7 @@ def main():
     hexagons, project, width, height, labels = build_hex_grid(
         Path("data/raw/boundary/uae_boundary.geojson"), extra_cells=all_data_cells
     )
-    zones_by_quarter, top5_by_quarter, kpis_by_quarter, domains, population_by_emirate = build_zone_data(
+    zones_by_quarter, top5_by_quarter, kpis_by_quarter, domains, population_by_emirate, area_names_by_cell = build_zone_data(
         priority_path, Path("data/processed/population_zones_uae.parquet")
     )
 
@@ -1120,7 +1155,7 @@ def main():
     ).strftime("%Y-%m-%d %H:%M:%SZ")
 
     html = render_html(hexagons, width, height, labels, zones_by_quarter, top5_by_quarter,
-                        kpis_by_quarter, domains, population_by_emirate,
+                        kpis_by_quarter, domains, population_by_emirate, area_names_by_cell,
                         build_id=build_id, data_path=priority_path.as_posix(), data_mtime=data_mtime)
 
     out_path = Path("data/processed/uae_dashboard.html")

@@ -8,9 +8,10 @@ Procedure, in the mentor's own order:
      'full' evidence-tier zones. Injected changes must clear this by a wide margin or no method
      could find them regardless of how good it is.
   2. Pick 10% of eligible ('full' tier, tests>=30, latest quarter) zones at random, inject one
-     of three faults: download -40% (spatial), latency +80% (spatial), or a gradual relative
-     decline (-8%/quarter for 3 quarters, temporal) -- split as evenly as the eligible
-     population allows across the three types.
+     of four faults (brief's own list): download -40% (spatial), latency +80% (spatial), a
+     gradual relative decline (-8%/quarter for 3 quarters, temporal), or a combined degradation
+     (download -40% AND latency +80% on the same zone at once, spatial) -- split as evenly as
+     the eligible population allows across the four types.
   3. Split the INJECTED zones 50/50 into a tuning half and a blind hold-out half (the untouched
      'normal' zones are split 50/50 too, so both halves have a realistic, comparable mix to
      evaluate precision/recall against). Fit each model on the full modified table (unsupervised
@@ -19,12 +20,19 @@ Procedure, in the mentor's own order:
      population). Contamination and the feature set are fixed by explicit spec here, so
      "tuning" reduces to a consistency check (printed for reference) rather than an actual
      hyperparameter search -- the hold-out half's numbers are what's reported as the result.
-  4. Report precision/recall/F1 on the hold-out half only.
+  4. Report precision/recall/F1/false-positive-rate on the hold-out half only (brief's own
+     required metric list), plus a per-fault-type recall breakdown for Isolation Forest so the
+     4 injected fault types (download-only, latency-only, combined, gradual decline) can be
+     told apart rather than averaged into one number.
   5. Baseline = bottom-decile Experience Index within peer group (src/anomaly_detection.py's
      production `add_baseline_bottom_decile`), threshold fit on the tuning half, applied to
      hold-out.
   6. LOF (LocalOutlierFactor(n_neighbors=20, contamination=0.08)) as a second comparison method
      alongside Isolation Forest, same features, same StandardScaler, same fit population.
+
+Recall target (brief's own requirement: set it from the data distribution, justify it, never
+tune it to flatter the result) -- see SINGLE_FAULT_RECALL_TARGET / COMBINED_FAULT_RECALL_TARGET
+below for the reasoning, fixed before this script ever inspects a hold-out result.
 
 Both models reuse `src/anomaly_detection.py`'s own feature-building and fit/score functions
 (`build_spatial_features`, `build_temporal_features`, `_fit_score_flag`) rather than
@@ -53,32 +61,51 @@ INJECTION_FRACTION = 0.10
 SEED = 123  # fixed once; never touched again after seeing results
 TAPER = [0.92, 0.84, 0.76]  # gradual -8%/quarter cumulative decline, 3 quarters
 
+# --- Recall target -- set here, from the data/model distribution, BEFORE this script ever runs
+# a detector or looks at a hold-out result (brief's own instruction: never tune to flatter the
+# result). Reasoning: CONTAMINATION=0.08 caps Isolation Forest at flagging 8% of the scored
+# population, and injected zones are ~10% of the eligible pool split ~evenly across 4 fault
+# types (~2.5% each) -- comfortably inside that budget, so the flagging budget isn't the binding
+# constraint here. Separability is: SPATIAL_FEATURE_COLS has 5 features (exp_gap, dl_z, ul_z,
+# lat_z, lat_ratio). A single-fault injection (download -40% OR latency +80% alone) pushes only
+# 1-2 of those 5 into the tail (the directly-hit z-score, plus a smaller knock-on shift in
+# exp_gap via the recomputed Experience Index) while the other 3-4 stay ordinary for that zone's
+# peer group -- Isolation Forest's isolation-path score is an average over all 5 dimensions, so
+# one strong outlier feature gets diluted by several ordinary ones. A combined injection (both
+# faults on the same zone) pushes 2-3 of 5 features into the tail simultaneously, which should
+# isolate faster (shorter average path length) and recall meaningfully better than either single
+# fault alone. Targets below are deliberately modest, not aspirational -- a diluted single-
+# feature signal is a genuinely hard case for this feature set, not a free win.
+SINGLE_FAULT_RECALL_TARGET = 0.30
+COMBINED_FAULT_RECALL_TARGET = 0.50
+
 
 # ---------------------------------------------------------------------------
 # Injection
 # ---------------------------------------------------------------------------
 
+FAULT_TYPES = ["download_drop", "latency_spike", "combined", "gradual_decline"]
+
+
 def _assign_injections(rng: np.random.Generator, eligible_ids: list[str],
                         eligible_temporal_ids: set[str], fraction: float) -> dict[str, str]:
-    """10% of eligible zones, split as evenly as possible across the three fault types --
-    temporal-eligible zones drawn from `eligible_temporal_ids` (>= 4 quarters of history)
-    specifically, since a gradual-decline injection is meaningless without one."""
+    """10% of eligible zones, split as evenly as possible across the brief's four fault types
+    (download -40% alone, latency +80% alone, both at once ["combined"], and the temporal
+    gradual decline) -- temporal-eligible zones drawn from `eligible_temporal_ids` (>= 4 quarters
+    of history) specifically, since a gradual-decline injection is meaningless without one."""
     n_inject = round(len(eligible_ids) * fraction)
-    n_each = n_inject // 3
-    n_download, n_latency, n_temporal = n_each, n_each, n_each
-    for i in range(n_inject - n_each * 3):
-        if i == 0:
-            n_download += 1
-        elif i == 1:
-            n_latency += 1
-        else:
-            n_temporal += 1
+    n_each = n_inject // 4
+    counts = {t: n_each for t in FAULT_TYPES}
+    for i in range(n_inject - n_each * 4):
+        counts[FAULT_TYPES[i]] += 1
 
-    n_temporal = min(n_temporal, len(eligible_temporal_ids))
-    temporal_ids = rng.choice(np.array(sorted(eligible_temporal_ids)), size=n_temporal, replace=False)
+    counts["gradual_decline"] = min(counts["gradual_decline"], len(eligible_temporal_ids))
+    temporal_ids = rng.choice(np.array(sorted(eligible_temporal_ids)), size=counts["gradual_decline"], replace=False)
     remaining_pool = rng.permutation([z for z in eligible_ids if z not in set(temporal_ids)])
+    n_download, n_latency, n_combined = counts["download_drop"], counts["latency_spike"], counts["combined"]
     download_ids = remaining_pool[:n_download]
     latency_ids = remaining_pool[n_download:n_download + n_latency]
+    combined_ids = remaining_pool[n_download + n_latency:n_download + n_latency + n_combined]
 
     assignment = {}
     for z in temporal_ids:
@@ -87,6 +114,8 @@ def _assign_injections(rng: np.random.Generator, eligible_ids: list[str],
         assignment[z] = "download_drop"
     for z in latency_ids:
         assignment[z] = "latency_spike"
+    for z in combined_ids:
+        assignment[z] = "combined"
     return assignment
 
 
@@ -97,8 +126,10 @@ def _apply_injections(df: pd.DataFrame, assignment: dict[str, str], quarter: str
     perturbed download/latency, not an approximation of it."""
     df = df.copy()
     latest_mask = df["quarter"] == quarter
-    download_ids = {z for z, t in assignment.items() if t == "download_drop"}
-    latency_ids = {z for z, t in assignment.items() if t == "latency_spike"}
+    # 'combined' zones get BOTH the download and latency fault applied at once (the brief's
+    # fourth fault type) -- simplest possible way to express that: membership in both sets.
+    download_ids = {z for z, t in assignment.items() if t in ("download_drop", "combined")}
+    latency_ids = {z for z, t in assignment.items() if t in ("latency_spike", "combined")}
     temporal_ids = {z for z, t in assignment.items() if t == "gradual_decline"}
 
     df.loc[latest_mask & df["h3_cell"].isin(download_ids), "download_mbps"] *= 0.60   # -40%
@@ -152,11 +183,13 @@ def _prf(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     tp = int(((y_true == 1) & (y_pred == 1)).sum())
     fp = int(((y_true == 0) & (y_pred == 1)).sum())
     fn = int(((y_true == 1) & (y_pred == 0)).sum())
+    tn = int(((y_true == 0) & (y_pred == 0)).sum())
     precision = tp / (tp + fp) if (tp + fp) else 0.0
     recall = tp / (tp + fn) if (tp + fn) else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    fpr = fp / (fp + tn) if (fp + tn) else 0.0  # false-positive rate -- brief's own required metric
     return {"precision": round(precision, 3), "recall": round(recall, 3), "f1": round(f1, 3),
-            "n_flagged": int(y_pred.sum()), "n_true": int(y_true.sum()), "n": len(y_true)}
+            "fpr": round(fpr, 3), "n_flagged": int(y_pred.sum()), "n_true": int(y_true.sum()), "n": len(y_true)}
 
 
 def _lof_flag(features: pd.DataFrame, contamination: float, n_neighbors: int = 20) -> np.ndarray:
@@ -170,8 +203,22 @@ def _lof_flag(features: pd.DataFrame, contamination: float, n_neighbors: int = 2
 
 
 # ---------------------------------------------------------------------------
-# Benchmark A -- spatial (Peer Gap ML): download -40%, latency +80%
+# Benchmark A -- spatial (Peer Gap ML): download -40%, latency +80%, combined
 # ---------------------------------------------------------------------------
+
+SPATIAL_FAULT_TYPES = ("download_drop", "latency_spike", "combined")
+
+
+def _per_fault_type_recall(assignment: dict, flag: pd.Series, idx) -> dict:
+    """Isolation Forest recall broken down by fault type, hold-out only -- lets "single-fault
+    signal is diluted across 5 features" (the SINGLE_FAULT_RECALL_TARGET reasoning above) be
+    checked directly against real numbers instead of buried inside one averaged recall."""
+    out = {}
+    for fault in SPATIAL_FAULT_TYPES:
+        fault_ids = [z for z in idx if assignment.get(z) == fault]
+        out[fault] = round(float(flag.loc[fault_ids].mean()), 3) if fault_ids else None
+    return out
+
 
 def run_benchmark_a(df_mod: pd.DataFrame, assignment: dict, tuning_ids: set, holdout_ids: set) -> pd.DataFrame:
     spatial = build_spatial_features(df_mod)
@@ -179,7 +226,7 @@ def run_benchmark_a(df_mod: pd.DataFrame, assignment: dict, tuning_ids: set, hol
     features = latest[SPATIAL_FEATURE_COLS].dropna()
 
     y_true_all = pd.Series(
-        {zid: int(assignment.get(zid) in ("download_drop", "latency_spike")) for zid in features.index}
+        {zid: int(assignment.get(zid) in SPATIAL_FAULT_TYPES) for zid in features.index}
     )
 
     iso_score, iso_flag = _fit_score_flag(features, contamination=CONTAMINATION)
@@ -199,6 +246,7 @@ def run_benchmark_a(df_mod: pd.DataFrame, assignment: dict, tuning_ids: set, hol
     )
 
     rows = []
+    holdout_idx = features.index.intersection(holdout_ids)
     for half_name, half_ids in [("tuning", tuning_ids), ("hold-out", holdout_ids)]:
         idx = features.index.intersection(half_ids)
         y_true = y_true_all.loc[idx].to_numpy()
@@ -206,7 +254,8 @@ def run_benchmark_a(df_mod: pd.DataFrame, assignment: dict, tuning_ids: set, hol
                              ("Baseline (bottom-decile Experience, peer group)", baseline_flag.loc[idx].to_numpy()),
                              ("LOF", lof_flag.loc[idx].to_numpy())]:
             rows.append({"half": half_name, "detector": label, **_prf(y_true, pred)})
-    return pd.DataFrame(rows)
+    per_fault_recall = _per_fault_type_recall(assignment, iso_flag, holdout_idx)
+    return pd.DataFrame(rows), per_fault_recall
 
 
 # ---------------------------------------------------------------------------
@@ -278,13 +327,25 @@ def test_t2_mentor_protocol():
           f"Hold-out: {len(holdout_ids)} zones ({len(holdout_inj)} injected)")
 
     print()
-    print("=== Benchmark A: spatial / Peer Gap (download -40%, latency +80%) ===")
-    a = run_benchmark_a(df_mod, assignment, tuning_ids, holdout_ids)
+    print("=== Benchmark A: spatial / Peer Gap (download -40%, latency +80%, combined) ===")
+    a, per_fault_recall = run_benchmark_a(df_mod, assignment, tuning_ids, holdout_ids)
     print(a.to_string(index=False))
     a_holdout = a[a["half"] == "hold-out"]
     for _, row in a_holdout.iterrows():
-        for metric in ["precision", "recall", "f1"]:
+        for metric in ["precision", "recall", "f1", "fpr"]:
             assert 0.0 <= row[metric] <= 1.0, f"{metric} out of range: {row[metric]}"
+
+    print()
+    print("Isolation Forest recall by fault type (hold-out only):")
+    for fault in SPATIAL_FAULT_TYPES:
+        target = COMBINED_FAULT_RECALL_TARGET if fault == "combined" else SINGLE_FAULT_RECALL_TARGET
+        value = per_fault_recall[fault]
+        if value is None:
+            print(f"  {fault:15} no hold-out zones of this type this run")
+        else:
+            met = "MET" if value >= target else "NOT MET"
+            print(f"  {fault:15} recall={value:.3f}  target={target:.2f}  [{met}] "
+                  f"(target set in advance -- see SINGLE_FAULT_RECALL_TARGET/COMBINED_FAULT_RECALL_TARGET)")
 
     print()
     print("=== Benchmark B: temporal (gradual -8%/quarter decline, 3 quarters) ===")
@@ -292,7 +353,7 @@ def test_t2_mentor_protocol():
     print(b.to_string(index=False))
     b_holdout = b[b["half"] == "hold-out"]
     for _, row in b_holdout.iterrows():
-        for metric in ["precision", "recall", "f1"]:
+        for metric in ["precision", "recall", "f1", "fpr"]:
             assert 0.0 <= row[metric] <= 1.0, f"{metric} out of range: {row[metric]}"
 
     print()
