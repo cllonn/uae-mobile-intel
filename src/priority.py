@@ -54,10 +54,24 @@ def _factor_band(series: pd.Series) -> pd.Series:
     return pd.cut(series, bins=[-0.01, 33, 66, 100], labels=["Low", "Medium", "High"])
 
 
+def _deterioration_factor(magnitude: pd.Series) -> pd.Series:
+    """0 (Low band, via `_factor_band`'s cut points) for every zone with zero deterioration
+    magnitude -- assigned directly, never percentile-ranked into whatever the tied-zero
+    cluster's average rank happens to be. Positive magnitudes (zones that cleared the
+    persistence gate) are percentile-ranked ONLY among themselves, so severity spreads across
+    the full 0-100 range based on how their relative decline compares to other currently-
+    deteriorating zones, rather than every one of them tying at the same value."""
+    factor = pd.Series(0.0, index=magnitude.index)
+    positive = magnitude > 0
+    if positive.any():
+        factor.loc[positive] = 100 * percentile_rank(magnitude.loc[positive])
+    return factor
+
+
 def add_priority(df: pd.DataFrame, weights: dict = PRIORITY_WEIGHTS) -> pd.DataFrame:
     """Adds `priority_score` (0-100), `priority_zone` (bool, top decile per quarter), the four
     underlying `factor_*` columns (0-100 each, percentile rank x100), and their Low/Medium/High
-    bands. Requires `peer_gap`, `deteriorating`, `population`, `confidence_score`,
+    bands. Requires `peer_gap`, `deterioration_magnitude`, `population`, `confidence_score`,
     `temporal_anomaly_ml_score` and `evidence_tier` already on `df`. Returns a new DataFrame.
 
     Shortlist eligibility (mentor-specified, 2026-09-01): only `evidence_tier == "full"` zones
@@ -80,16 +94,22 @@ def add_priority(df: pd.DataFrame, weights: dict = PRIORITY_WEIGHTS) -> pd.DataF
     classified["peer_gap_raw"] = (-classified["peer_gap"]).clip(lower=0)
     classified["factor_peer_gap"] = 100 * classified.groupby("quarter")["peer_gap_raw"].transform(percentile_rank)
 
-    # Deterioration: the brief's own definition is a *continuous* relative-to-national-trend
-    # slope, set to zero unless the decline persists. `src/trends.py` isn't being touched this
-    # step (ML/trend methodology is out of scope here), so this uses the existing `deteriorating`
-    # boolean it already computes (persistent-decline-vs-peers, gated at 3 consecutive quarters)
-    # as the raw input -- percentile-ranking a 0/1 column yields exactly two factor values per
-    # quarter (all non-deteriorating zones tied low, all deteriorating zones tied high), which
-    # is a real simplification of the mentor's continuous-slope vision, not a full implementation
-    # of it. A genuinely continuous version would need a new relative-slope stat from trends.py.
-    classified["factor_deterioration"] = 100 * classified.groupby("quarter")["deteriorating"].transform(
-        lambda s: percentile_rank(s.astype(float))
+    # Deterioration (mentor methodology, 2026-09-15): a continuous relative-to-national-trend
+    # severity, zero unless the decline has persisted `trends.CONSECUTIVE_DECLINES_REQUIRED`
+    # consecutive quarters -- `src/trends.py::deterioration_magnitude` already IS this value (0
+    # when the persistence gate isn't met, otherwise the mean per-quarter national-relative
+    # decline size across the zone's current streak). Percentile-ranking the raw boolean here
+    # used to collapse every deteriorating zone to one tied top value regardless of how severe
+    # its decline actually was, and tied the entire non-deteriorating majority to one middling
+    # rank instead of 0 (a 90%-tied-at-zero cluster's *average* rank lands near the middle of
+    # its own span, not at the bottom) -- landing the whole non-deteriorating population in
+    # "Medium" nationally, not "Low". `_deterioration_factor` below fixes both: zero magnitude
+    # is assigned factor 0 directly (never percentile-ranked into the tied cluster), and only
+    # the positive (actually-deteriorating) values are percentile-ranked among themselves, so
+    # severity differentiates a barely-there 2-quarter dip from a steep 4-quarter slide instead
+    # of tying them at the same "High" value.
+    classified["factor_deterioration"] = classified.groupby("quarter")["deterioration_magnitude"].transform(
+        _deterioration_factor
     )
 
     # TemporalAnomaly is now its own distinct factor (previously averaged together with the

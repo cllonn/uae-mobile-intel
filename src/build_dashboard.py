@@ -253,7 +253,13 @@ def build_zone_data(priority_path: Path, population_path: Path):
         for _, row in area_names_df.iterrows()
     }
 
-    trend_abs = classified_all["trend_pts_per_qtr"].dropna().abs()
+    # trend_pts_per_qtr is a per-ZONE constant (src/trends.py assigns the same value to every
+    # quarter-row of a zone) -- percentiling it over classified_all's zone-QUARTER rows would
+    # implicitly weight each zone by how many quarters it's classified in (a zone classified in
+    # 8 quarters counts 8x, one classified in 2 counts 2x), which isn't what "the 95th percentile
+    # of zones' trend magnitude" is supposed to mean. Dedupe to one row per h3_cell first so
+    # every zone contributes exactly once regardless of its own history length.
+    trend_abs = classified_all.drop_duplicates("h3_cell")["trend_pts_per_qtr"].dropna().abs()
     domains = {
         "experience": [0, 100],
         "confidence": [0, 100],
@@ -905,7 +911,7 @@ function selectZone(id) {
     <div class="panel-title">Why this priority &ndash; factor contributions</div>
     ${factorRow('Experience gap vs. peers', z.bands.peer_gap)}
     ${factorRow('Temporal anomaly (vs. own history)', z.bands.temporal_anomaly)}
-    ${factorRow('Deterioration', z.bands.deterioration)}
+    ${factorRow('Deterioration severity', z.bands.deterioration)}
     ${factorRow('Population exposure', z.bands.population)}` : '';
 
   panel.innerHTML = `
@@ -1025,7 +1031,7 @@ const GEO_TOOLS = new Set([
   'get_zone_details', 'get_zone_peer_comparison', 'get_zone_trend',
   'get_top_priority_zones', 'get_priority_zones', 'get_weakest_zones', 'get_strongest_zones',
   'get_deteriorating_zones', 'get_anomalous_zones', 'get_high_population_weak_zones',
-  'get_metric_threshold_zones', 'get_metric_extreme', 'locate_area',
+  'get_zones_by_peer_group', 'get_metric_threshold_zones', 'get_metric_extreme', 'locate_area',
 ]);
 
 // Enters Copilot result focus mode on exactly the H3 ids passed in, replacing whatever the

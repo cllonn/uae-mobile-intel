@@ -17,8 +17,11 @@ scikit-learn==1.7.2
 folium==0.20.0
 
 # GenAI (optional -- only needed to connect a real LLM to src/copilot.py; without it, the
-# copilot runs in deterministic template-narration mode with zero external calls)
-# anthropic==0.69.0
+# copilot runs in deterministic template-narration mode, and the semantic intent-classification
+# fallback in route() is simply unavailable (falls back to the same "could not map" message a
+# deterministic miss already gives) -- zero external calls either way without this installed and
+# ANTHROPIC_API_KEY set)
+anthropic==0.69.0
 
 # Notebook execution (VS Code / Jupyter)
 ipykernel==7.3.0

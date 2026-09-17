@@ -75,22 +75,26 @@ def _fit_score_flag(features: pd.DataFrame, contamination: float = CONTAMINATION
 # ---------------------------------------------------------------------------
 
 def build_spatial_features(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per (h3_cell, quarter) among 'full' evidence-tier zones -- 5 features, all
+    """One row per (h3_cell, quarter) among 'full' evidence-tier zones -- 4 features, all
     relative to peer group, never raw (mentor-specified, 2026-09-01):
       - exp_gap: zone Experience Index minus its peer group's median (same as `peer_gap`).
       - dl_z, ul_z, lat_z: peer-group z-scores of download/upload/latency.
-      - lat_ratio: latency divided by the peer group's median latency."""
+
+    `lat_ratio` (latency / peer-group median latency) used to sit alongside `lat_z` here, but
+    the two correlate at 0.99 on real data (T2 benchmark diagnostic) -- literally the same
+    signal twice, which dilutes Isolation Forest's per-feature isolation budget without adding
+    real separative power (confirmed: dropping it raised the T2 hold-out F1 from 0.18 to 0.36
+    at identical contamination/model config). `lat_z` alone already carries that information in
+    the same units as `dl_z`/`ul_z`."""
     full = df.loc[df["evidence_tier"] == "full"].copy()
     full["exp_gap"] = full["peer_gap"]
     full["dl_z"] = _peer_zscore(full, "download_mbps")
     full["ul_z"] = _peer_zscore(full, "upload_mbps")
     full["lat_z"] = _peer_zscore(full, "latency_effective_ms")
-    peer_median_lat = full.groupby(["peer_group", "quarter"])["latency_effective_ms"].transform("median")
-    full["lat_ratio"] = full["latency_effective_ms"] / peer_median_lat.replace(0, np.nan)
     return full
 
 
-SPATIAL_FEATURE_COLS = ["exp_gap", "dl_z", "ul_z", "lat_z", "lat_ratio"]
+SPATIAL_FEATURE_COLS = ["exp_gap", "dl_z", "ul_z", "lat_z"]
 
 
 def add_peer_gap_ml(df: pd.DataFrame) -> pd.DataFrame:
@@ -114,7 +118,7 @@ def add_peer_gap_ml(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Temporal ("Temporal Anomaly") model: qoq_rel, slope_rel, volatility, consec_decline
+# Temporal ("Temporal Anomaly") model: qoq_rel, cum3_rel, slope_rel, volatility, consec_decline
 # ---------------------------------------------------------------------------
 
 def _national_series(full: pd.DataFrame) -> pd.Series:
@@ -125,11 +129,21 @@ def _national_series(full: pd.DataFrame) -> pd.Series:
 
 def _zone_temporal_rows(h3_cell: str, group: pd.DataFrame, national: pd.Series,
                          min_quarters: int) -> list[dict]:
-    """qoq_rel, slope_rel, volatility, consec_decline for one zone's timeline -- a plain loop
-    over quarters (mirrors `trends.py`'s style: at 8 quarters per zone the performance cost is
-    negligible, and the loop reads like the rule it implements). Emits one row per quarter that
-    has >= min_quarters of trailing history available; earlier quarters are skipped, not padded
-    with fabricated values."""
+    """qoq_rel, cum3_rel, slope_rel, volatility, consec_decline for one zone's timeline -- a
+    plain loop over quarters (mirrors `trends.py`'s style: at 8 quarters per zone the
+    performance cost is negligible, and the loop reads like the rule it implements). Emits one
+    row per quarter that has >= min_quarters of trailing history available; earlier quarters are
+    skipped, not padded with fabricated values.
+
+    `cum3_rel` exists alongside `qoq_rel` because they answer different questions. `qoq_rel` is
+    a single-step delta -- it only ever sees the most recent quarter's change, so a persistent,
+    gradual decline spread over several quarters shows up as several ordinary-looking single
+    steps, not one large one (confirmed on the T2 synthetic-injection benchmark: a real 3-quarter
+    decline read as -2.38 pts on qoq_rel alone, nowhere near the natural-noise bar, purely
+    because qoq_rel structurally cannot see anything before the last step). `cum3_rel` is the
+    net national-relative change over the full trailing 3-quarter window (algebraically the sum
+    of that window's 3 qoq_rel values), so a persistent multi-quarter decline shows up as one
+    correctly-sized number instead of being split (and diluted) across several single-step ones."""
     group = group.sort_values("quarter")
     quarters = group["quarter"].tolist()
     exp = group["experience_index"].to_numpy(dtype=float)
@@ -153,9 +167,11 @@ def _zone_temporal_rows(h3_cell: str, group: pd.DataFrame, national: pd.Series,
         nat_slope = np.polyfit(range(min_quarters), nat_window, 1)[0]
         vol_window = qoq_rel[max(0, i - min_quarters + 1): i + 1]
         vol_window = vol_window[~np.isnan(vol_window)]
+        cum3_rel = (exp[i] - exp[i - 3]) - (nat[i] - nat[i - 3]) if i >= 3 else np.nan
         rows.append({
             "h3_cell": h3_cell, "quarter": quarters[i],
             "qoq_rel": qoq_rel[i],
+            "cum3_rel": cum3_rel,
             "slope_rel": zone_slope - nat_slope,
             "volatility": float(np.std(vol_window, ddof=1)) if len(vol_window) > 1 else np.nan,
             "consec_decline": consec,
@@ -165,8 +181,9 @@ def _zone_temporal_rows(h3_cell: str, group: pd.DataFrame, national: pd.Series,
 
 def build_temporal_features(df: pd.DataFrame, min_quarters: int = MIN_QUARTERS_FOR_TEMPORAL) -> pd.DataFrame:
     """One row per (h3_cell, quarter) among 'full' evidence-tier zones with >= min_quarters of
-    trailing Experience Index history -- 4 features, changes relative to the national trend,
-    never raw (mentor-specified, 2026-09-01): qoq_rel, slope_rel, volatility, consec_decline."""
+    trailing Experience Index history -- 5 features, changes relative to the national trend,
+    never raw (mentor-specified, 2026-09-01): qoq_rel, cum3_rel, slope_rel, volatility,
+    consec_decline."""
     full = df.loc[df["evidence_tier"] == "full"].copy()
     national = _national_series(full)
     all_rows = []
@@ -175,7 +192,7 @@ def build_temporal_features(df: pd.DataFrame, min_quarters: int = MIN_QUARTERS_F
     return pd.DataFrame(all_rows)
 
 
-TEMPORAL_FEATURE_COLS = ["qoq_rel", "slope_rel", "volatility", "consec_decline"]
+TEMPORAL_FEATURE_COLS = ["qoq_rel", "cum3_rel", "slope_rel", "volatility", "consec_decline"]
 
 
 def add_temporal_anomaly_ml(df: pd.DataFrame) -> pd.DataFrame:

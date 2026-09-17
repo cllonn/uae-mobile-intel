@@ -103,11 +103,21 @@ def add_effective_latency(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_quarters_observed(df: pd.DataFrame, total_quarters: int = TOTAL_QUARTERS) -> pd.DataFrame:
-    """How many of the dataset's quarters each zone has any measurement in -- the temporal-
-    coverage signal Confidence needs. Same value repeated on every quarter-row of a given zone,
-    since it describes the zone's overall track record, not just the current quarter."""
+    """How many of the dataset's quarters each zone has a MEANINGFUL measurement in -- the
+    temporal-coverage signal Confidence needs. 'Meaningful' uses the same tests/devices bar as
+    `compute_evidence_tier`'s 'insufficient' cutoff (tests >= MIN_TESTS_INSUFFICIENT and
+    devices >= MIN_DEVICES_INSUFFICIENT) -- a quarter with a single stray test is real data but
+    not a real observation of the zone's typical experience, and previously counted identically
+    to a well-measured quarter (e.g. a zone could show "8/8 quarters observed" with only 4 of
+    those quarters actually clearing the evidence bar the rest of this pipeline already applies
+    everywhere else, inflating its Confidence Score's 20%-weighted quarters component). Same
+    value repeated on every quarter-row of a given zone, since it describes the zone's overall
+    track record, not just the current quarter. Computed inline here (not by reading
+    `evidence_tier`) so this function stays independent of pipeline order --
+    `score_zone_quarters` calls this before `compute_evidence_tier` runs."""
     df = df.copy()
-    df["quarters_observed"] = df.groupby("h3_cell")["quarter"].transform("nunique")
+    meaningful = (df["tests"] >= MIN_TESTS_INSUFFICIENT) & (df["devices"] >= MIN_DEVICES_INSUFFICIENT)
+    df["quarters_observed"] = df.assign(_meaningful=meaningful).groupby("h3_cell")["_meaningful"].transform("sum")
     return df
 
 

@@ -18,8 +18,37 @@ not a requirement.
 import difflib
 import os
 import re
+from pathlib import Path
 
 from src import copilot_tools as ct
+from src.trends import CONSECUTIVE_DECLINES_REQUIRED
+
+
+def _load_dotenv_if_present() -> None:
+    """Minimal, stdlib-only loader for a `.env` file at the repo root (ANTHROPIC_API_KEY, most
+    importantly) -- so any entry point that imports this module (`src.serve_dashboard`, a
+    script, a notebook) picks up a locally-configured key without whoever launched that process
+    having to `export`/`set` it in that exact shell first. Missing that is easy and silent: the
+    process just falls back to deterministic-only mode with no error, which is exactly what
+    made a real API key look like it "wasn't working" when the server process launching it
+    predates the key being configured. Never overrides a variable already set in the real
+    environment (an explicit `export`/`set` always wins over the file). Not python-dotenv --
+    this repo has zero GenAI dependency without a key configured at all (see requirements.txt),
+    so this stays a few stdlib lines rather than adding a package just for this."""
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value.strip()
+
+
+_load_dotenv_if_present()
 
 # Central emirate alias table -- canonical name -> every accepted alias/abbreviation, each
 # already lowercase (matching is done on normalized, lowercased text; see _normalize_geo_text).
@@ -81,6 +110,39 @@ DATA_SOURCE_MESSAGE = (
 )
 
 AREA_NOT_FOUND_MESSAGE = "I couldn't confidently match that to an area in the map. Could you check the name?"
+
+# Genuinely couldn't be understood as any supported analytics request -- deterministic routing
+# found nothing AND the semantic classifier (when connected) either agreed or wasn't available.
+# Deliberately says nothing about "canonical questions" or any other internal/project
+# terminology -- that phrasing is for this repo's own docs and tests, never surfaced to a real
+# dashboard user.
+UNMATCHED_MESSAGE = (
+    "I'm not sure what you'd like to check. You can ask me about areas that need attention, "
+    "mobile experience, download or upload speeds, changes over time, or a specific area."
+)
+
+# ---------------------------------------------------------------------------
+# Basic conversational check -- runs BEFORE refusal/routing/semantic classification, entirely
+# deterministic (a fixed, closed set of greeting words, not a judgment call an LLM should make).
+# Only matches a message that IS a bare greeting and nothing else (`fullmatch`, allowing trailing
+# punctuation/a name) -- "hi, which areas need attention?" still falls through to real routing
+# unaffected; only a standalone "hi"/"hello"/"good morning"/etc. gets the canned reply below.
+# ---------------------------------------------------------------------------
+
+GREETING_MESSAGE = (
+    "Hi! I can help you explore UAE public mobile experience. You can ask which areas need "
+    "attention, where experience is strongest or weakest, or what has changed over time."
+)
+
+_GREETING_RE = re.compile(
+    r"^\s*(hi+|hello+|hey+|hiya|yo|howdy|greetings|sup|what'?s\s*up|"
+    r"good\s*(morning|afternoon|evening|day))\s*(there|team|everyone)?\s*[!.,?]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def check_greeting(question: str) -> str | None:
+    return GREETING_MESSAGE if _GREETING_RE.match(question) else None
 
 
 def check_refusal(question: str) -> str | None:
@@ -406,6 +468,75 @@ def _global_metric_intent_present(question: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Severity modifier resolution (2026-09-17) -- shared by the anomalous-areas and
+# deteriorating-areas branches below, and by the semantic classifier's own 'severity' field
+# validation, so "high/medium/low" and "highest/strongest/top N" are recognized once,
+# consistently, rather than reimplemented per branch. Deliberately narrow: only the exact band
+# words resolve to a band filter; superlative words resolve to a RANKING request instead (rank
+# by the real factor score, cap at N) -- "areas that ARE high severity" and "the N most severe
+# areas" are different questions, never conflated.
+# ---------------------------------------------------------------------------
+
+_SEVERITY_BAND_ALIASES: dict[str, list[str]] = {
+    "high": ["high", "severe"],
+    "medium": ["medium", "moderate"],
+    "low": ["low", "mild"],
+}
+
+# Superlative words that mean "rank by score, give me the top N" -- never a band filter, even
+# though "highest"/"strongest" sound like they could mean 'high' severity. See
+# _wants_severity_ranking below.
+_SEVERITY_RANKING_WORDS = ["highest", "strongest", "most", "top"]
+
+
+def _resolve_severity_band(question: str) -> str | None:
+    """'low'/'medium'/'high' if the question uses that exact band word (or a light synonym),
+    else None. A superlative ('highest', 'strongest', ...) never resolves here -- callers check
+    _wants_severity_ranking for that, a different question with different tool arguments."""
+    normalized = _normalize_geo_text(question)
+    for canonical, aliases in _SEVERITY_BAND_ALIASES.items():
+        for alias in aliases:
+            if re.search(rf"\b{re.escape(alias)}\b", normalized):
+                return canonical
+    return None
+
+
+def _wants_severity_ranking(question: str) -> bool:
+    """True for 'highest/strongest/most/top N ...' phrasing -- "rank by the actual factor/
+    score and return the top N," never a Low/Medium/High band filter."""
+    q = question.lower()
+    return bool(re.search(r"\b(" + "|".join(_SEVERITY_RANKING_WORDS) + r")\b", q))
+
+
+# ---------------------------------------------------------------------------
+# Peer-group filter -- "show me industrial areas", "which zones are commercial", "show
+# low-density residential areas". A plain categorical filter over the composite peer-group
+# classifier's 4 stable groups (never an OSM land-use tag -- see project methodology), matched
+# by common synonyms so a caller never has to type the exact stored label. PEER_GROUPS itself
+# (the exact strings this resolves TO) lives in copilot_tools.py, the module that actually
+# knows what's in the data -- imported here rather than duplicated, so the two can't drift.
+# ---------------------------------------------------------------------------
+
+PEER_GROUP_ALIASES: dict[str, list[str]] = {
+    "industrial": ["industrial", "industry", "industries"],
+    "commercial/urban-core": ["commercial/urban-core", "commercial", "urban core", "urban-core"],
+    "low-density residential": [
+        "low-density residential", "low density residential", "residential", "low-density", "low density",
+    ],
+    "rural/edge": ["rural/edge", "rural"],
+}
+
+
+def _resolve_peer_group(question: str) -> str | None:
+    normalized = _normalize_geo_text(question)
+    for canonical, aliases in PEER_GROUP_ALIASES.items():
+        for alias in aliases:
+            if re.search(rf"\b{re.escape(alias)}\b", normalized):
+                return canonical
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Area/place lookup -- "show me Seyouh", "where is Deira", "find Al Nahda", "take me to Al
 # Majaz", "show Khalifa City on the map". This is the LAST resolver route() tries, run only on a
 # question that every canonical-question branch above has already declined -- so a phrasing that
@@ -496,6 +627,25 @@ def _normalize_area_text(text: str) -> str:
     text = text.lower().replace("-", " ")
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     return re.sub(r"\s+", " ", text).strip()
+
+
+_SENTENCE_MARKER_WORDS = frozenset({
+    "that", "is", "are", "am", "was", "were", "isn't", "aren't", "wasn't", "weren't",
+    "doesn't", "don't", "didn't", "as", "than", "over", "doing", "similar", "getting",
+})
+
+
+def _looks_like_a_sentence_not_a_name(phrase: str) -> bool:
+    """True when a locate-style trigger ('show me X') matched, but X reads like an ordinary
+    English clause rather than an attempted place name -- e.g. "areas that are worsening over
+    time" vs. "Al Seyouh Suburb" or even genuine gibberish like "asdkjaksjdaksjd". Real UAE
+    place names in this dataset run up to 6 words (checked against `ct.get_known_area_names()`
+    at the time this was written) but never contain a plain English function word like these --
+    used only to decide whether a FAILED fuzzy match should fall through to "unmatched" (this
+    might not have been a locate question at all) or commit to a confident "not found" (a
+    genuine, if garbled, short place-name attempt) -- see route()'s own locate-lookup branch."""
+    words = set(_normalize_area_text(phrase).split())
+    return bool(words & _SENTENCE_MARKER_WORDS)
 
 
 def _strip_leading_article(tokens: list[str]) -> list[str]:
@@ -635,7 +785,18 @@ def route(question: str, zone_id: str | None = None) -> tuple[str, dict]:
     # experience getting worse?" has no 'deteriorat'/'declin' root at all, so it fell through to
     # the Experience-ranking resolver below, where 'worse' fuzzy-matches 'worst' (a CURRENT-
     # weakest, not a TREND, question) and silently answers the wrong question.
-    if re.search(r"\b(deteriorat\w*|declin\w*|worse over time|getting worse)\b", q):
+    # 'decreas\w*' added (2026-09-17) alongside 'declin\w*' for the identical reason 'declin\w*'
+    # itself was added: without it, "where is experience decreasing over time?" has no
+    # deterioration-root word at all, so it fell through to the Experience-ranking resolver
+    # below, where "experience" alone (with no clear direction word) claims the question with a
+    # confident-looking but WRONG clarify ("highest experience or lowest experience?"),
+    # short-circuiting it before it could ever reach "unmatched" and the semantic classifier.
+    # 'worsening' NOT added here even though it means the same thing -- deliberate: this
+    # deterministic branch only needs to catch phrasings that were already reliable, unambiguous
+    # keyword matches; an unfamiliar synonym like 'worsening' is exactly what the semantic
+    # classifier (route()'s caller falls back to it on "unmatched") is for, and "worsening" alone
+    # doesn't get wrongly claimed by any earlier, more-eager resolver the way "decreasing" did.
+    if re.search(r"\b(deteriorat\w*|declin\w*|decreas\w*|worse over time|getting worse)\b", q):
         args = {"emirate": emirate}
         # No explicit count keeps the full flagged list (unchanged default behavior) UNLESS the
         # question is itself singular ("which AREA deteriorated the most" wants exactly one
@@ -645,14 +806,40 @@ def route(question: str, zone_id: str | None = None) -> tuple[str, dict]:
             args["n"] = explicit_n
         elif _wants_single_zone(q):
             args["n"] = 1
+        # Severity (2026-09-17): "high/medium/low deterioration" filters on deterioration_band
+        # (a DIFFERENT question from the bare "is it deteriorating" flag above); a superlative
+        # ("strongest"/"most") instead asks for a ranked top N by severity, which takes
+        # precedence over a plain band word if both somehow appear.
+        if _wants_severity_ranking(q) and "n" not in args:
+            args["n"] = 5
+        elif not _wants_severity_ranking(q):
+            severity = _resolve_severity_band(q)
+            if severity:
+                args["severity"] = severity
         return "get_deteriorating_zones", args
     # Broadened from the original 'anomal(ous)'/'unusual' pair: 'unusual\b' alone never matched
     # its own adverb form ('unusually'), and 'underperform'/'peer gap(s)' are realistic ways to
     # ask for the same peer-comparison listing without either root word at all (e.g. "which zones
     # underperform comparable areas", "show the biggest peer gaps").
     if re.search(r"\banomal\w*|unusual\w*|underperform\w*|\bpeer gaps?\b", q):
-        kind = "temporal" if re.search(r"\bhistory|own past|over time\b", q) else "peer_gap"
-        return "get_anomalous_zones", {"kind": kind, "emirate": emirate}
+        # 'temporal' checked literally (2026-09-17 fix) -- "areas with high TEMPORAL anomaly"
+        # has no 'history'/'own past'/'over time' phrase at all, so this used to silently fall
+        # through to kind='peer_gap' (an entirely different ML model) despite the question
+        # naming the exact kind it wanted.
+        kind = "temporal" if re.search(r"\btemporal\b|\bhistory|own past|over time\b", q) else "peer_gap"
+        args = {"kind": kind, "emirate": emirate}
+        # Severity (2026-09-17): "high/medium/low temporal anomaly" must filter on the zone's
+        # own *_band (the Priority factor's severity), never quietly substitute the ML flag's
+        # top-~8%-contamination set for it -- see get_anomalous_zones' own docstring for why
+        # those are not guaranteed to be the same set. A superlative ("highest"/"strongest")
+        # instead ranks by the real factor score and caps at N.
+        if _wants_severity_ranking(q):
+            args["n"] = _extract_explicit_n(q) or 5
+        else:
+            severity = _resolve_severity_band(q)
+            if severity:
+                args["severity"] = severity
+        return "get_anomalous_zones", args
     # 'people' accepted alongside the literal 'population' -- "which weak areas affect the most
     # people?" never says "population" at all, and previously fell through to the bare
     # weak/lowest/worst bucket further below (a plain Experience-ranking listing, silently
@@ -720,32 +907,65 @@ def route(question: str, zone_id: str | None = None) -> tuple[str, dict]:
     if re.search(r"\bcoverage|represent|how much of\b", q):
         return "get_coverage_summary", {"emirate": emirate}
 
+    # Peer-group filter (2026-09-17) -- "show me industrial areas", "which zones are commercial".
+    # Checked late (after every ranking/severity/coverage branch above), since none of those
+    # keyword sets overlap with the 4 peer-group names/synonyms -- a genuine peer-group question
+    # never reaches here having already been mis-claimed by an earlier branch.
+    peer_group = _resolve_peer_group(question)
+    if peer_group is not None:
+        args = {"peer_group": peer_group, "emirate": emirate}
+        explicit_n = _extract_explicit_n(q)
+        if explicit_n is not None:
+            args["n"] = explicit_n
+        return "get_zones_by_peer_group", args
+
     # Area/place lookup -- last resort; see the block above for why this ordering never steals a
     # question any earlier branch already claims. Uses the ORIGINAL `question` (not the
     # lowercased `q`) so the extracted phrase keeps its real casing for exact-match matching.
     locate_phrase = _extract_locate_phrase(question)
     if locate_phrase is not None:
-        known = ct.get_known_area_names()
-        match = _match_area_name(locate_phrase, known)
-        if match["status"] == "no_match":
-            return "locate_area_not_found", {}
-        if match["status"] == "ambiguous":
-            return "clarify", {"suggestion": _join_or(match["candidates"])}
-        area_name = match["area_name"]
-        emirates_for_name = sorted({row["emirate"] for row in known if row["area_name"] == area_name})
-        if emirate:
-            if emirate not in emirates_for_name:
-                # The user named an emirate this place doesn't actually have a zone in -- treat
-                # as no confident match rather than silently ignoring the stated scope.
-                return "locate_area_not_found", {}
-            resolved_emirate = emirate
-        elif len(emirates_for_name) == 1:
-            resolved_emirate = emirates_for_name[0]
-        else:
-            return "clarify", {"suggestion": f"{area_name} in {' or '.join(emirates_for_name)}"}
-        return "locate_area", {"area_name": area_name, "emirate": resolved_emirate}
+        tool_name, tool_args = _resolve_locate_phrase(locate_phrase, emirate)
+        # A failed match on something that reads like a full English clause (2026-09-17 fix)
+        # falls through to "unmatched" instead of committing to "not found" -- this heuristic is
+        # the LAST resort in this file, so a "show me <sentence>" question that isn't really
+        # about a place (e.g. "show me areas that are worsening over time") deserves a real shot
+        # at the semantic classifier, not a locate failure message. A short/garbled genuine
+        # place-name attempt (e.g. "show me asdkjaksjdaksjd") has no sentence-marker word, so it
+        # still resolves to a confident "not found" exactly as before.
+        if tool_name == "locate_area_not_found" and _looks_like_a_sentence_not_a_name(locate_phrase):
+            return "unmatched", {}
+        return tool_name, tool_args
 
     return "unmatched", {}
+
+
+def _resolve_locate_phrase(phrase: str, emirate: str | None) -> tuple[str, dict]:
+    """Shared by route()'s own locate-trigger branch above and the semantic classifier's
+    'locate_area' intent below -- one place-name resolution path, so a free-text place name
+    coming from either a matched trigger phrase or an LLM's own reading of the question goes
+    through the exact same exact/normalized/alias/fuzzy matching against the real area-name
+    universe (`_match_area_name`), never a second, looser one. `emirate` is always the
+    deterministically-resolved one (`_extract_emirate` over the whole original question) --
+    this function never receives or trusts an emirate guess from anywhere else."""
+    known = ct.get_known_area_names()
+    match = _match_area_name(phrase, known)
+    if match["status"] == "no_match":
+        return "locate_area_not_found", {}
+    if match["status"] == "ambiguous":
+        return "clarify", {"suggestion": _join_or(match["candidates"])}
+    area_name = match["area_name"]
+    emirates_for_name = sorted({row["emirate"] for row in known if row["area_name"] == area_name})
+    if emirate:
+        if emirate not in emirates_for_name:
+            # The user named an emirate this place doesn't actually have a zone in -- treat
+            # as no confident match rather than silently ignoring the stated scope.
+            return "locate_area_not_found", {}
+        resolved_emirate = emirate
+    elif len(emirates_for_name) == 1:
+        resolved_emirate = emirates_for_name[0]
+    else:
+        return "clarify", {"suggestion": f"{area_name} in {' or '.join(emirates_for_name)}"}
+    return "locate_area", {"area_name": area_name, "emirate": resolved_emirate}
 
 
 _TOOLS = {
@@ -759,6 +979,7 @@ _TOOLS = {
     "get_deteriorating_zones": ct.get_deteriorating_zones,
     "get_anomalous_zones": ct.get_anomalous_zones,
     "get_high_population_weak_zones": ct.get_high_population_weak_zones,
+    "get_zones_by_peer_group": ct.get_zones_by_peer_group,
     "get_metric_threshold_zones": ct.get_metric_threshold_zones,
     "get_metric_extreme": ct.get_metric_extreme,
     "get_coverage_summary": ct.get_coverage_summary,
@@ -770,6 +991,320 @@ _TOOLS = {
 # determined set, used only by generate_all_priority_zone_briefs below) are different
 # questions. It's registered in _TOOLS so answer_question() can still dispatch to it directly
 # if a caller passes the tool name explicitly.
+
+
+# ---------------------------------------------------------------------------
+# Semantic intent classification -- the LLM half of the hybrid architecture.
+#
+#     question -> route() (deterministic) -> confident match? -> run tool
+#                                           -> "unmatched"?     -> classify_intent_semantic()
+#                                                                  -> validated intent? -> run tool
+#                                                                  -> low confidence?    -> clarify
+#                                                                  -> no match/no LLM?   -> "unmatched"
+#
+# Called ONLY from answer_question() when route() has already returned "unmatched" -- it never
+# runs on, and never overrides, a confident deterministic match. The model chooses from a fixed
+# enum of the SAME intents/tools route() itself can already produce (SEMANTIC_INTENTS below) --
+# it is never offered a new capability, never asked for a raw number, score, or area name it
+# invents from nothing, and it never computes the answer itself (that's still entirely
+# `src/copilot_tools.py`, exactly as for a deterministic match). Every field the model returns is
+# re-validated against a strict allowlist in `_validate_semantic_output` before anything runs;
+# anything that doesn't validate -- wrong intent name, out-of-enum parameter, missing required
+# parameter, low self-reported confidence -- falls back to "clarify" or the same "could not map"
+# message a deterministic miss already gives, never a guess. `n` and `emirate` are resolved the
+# same deterministic way as everywhere else in this file (`_extract_n`/`_extract_emirate`) rather
+# than trusted from the model's own output, for the same reason route() never lets the LLM decide
+# an emirate or a count: both are simple, unambiguous lookups this file already does reliably.
+# ---------------------------------------------------------------------------
+
+SEMANTIC_MODEL = "claude-sonnet-5"
+SEMANTIC_MAX_TOKENS = 300
+# Same bar every other fuzzy resolver in this file uses (_CONFIDENCE_THRESHOLD) -- one
+# "confident enough to act without asking" bar across the whole file, deterministic or semantic.
+SEMANTIC_CONFIDENCE_THRESHOLD = _CONFIDENCE_THRESHOLD
+
+# intent label (what the model sees/returns) -> which tool it maps to, whether it requires a
+# zone already selected (offered to the model only when zone_id is not None), and which EXTRA
+# parameters (beyond the always-deterministic n/emirate) the model may supply for it. This is
+# the complete list of intents the model can ever choose -- adding a new one here is the only
+# way to expand what the semantic path can reach, and it must correspond to a tool `route()`
+# could already reach deterministically (this file adds no new analytics capability).
+SEMANTIC_INTENTS: dict[str, dict] = {
+    "priority_areas": {"tool": "get_top_priority_zones", "zone_scoped": False, "takes_n": True, "extra": []},
+    "weakest_areas": {"tool": "get_weakest_zones", "zone_scoped": False, "takes_n": True, "extra": []},
+    "strongest_areas": {"tool": "get_strongest_zones", "zone_scoped": False, "takes_n": True, "extra": []},
+    "deteriorating_areas": {"tool": "get_deteriorating_zones", "zone_scoped": False, "takes_n": True, "extra": ["severity"]},
+    "anomalous_areas": {"tool": "get_anomalous_zones", "zone_scoped": False, "takes_n": True, "extra": ["kind", "severity"]},
+    "population_exposure_weak_areas": {"tool": "get_high_population_weak_zones", "zone_scoped": False, "takes_n": True, "extra": []},
+    "peer_group_filter": {"tool": "get_zones_by_peer_group", "zone_scoped": False, "takes_n": True, "extra": ["peer_group"]},
+    "metric_threshold_areas": {"tool": "get_metric_threshold_zones", "zone_scoped": False, "takes_n": False, "extra": ["metric", "comparison"]},
+    "metric_extreme": {"tool": "get_metric_extreme", "zone_scoped": False, "takes_n": False, "extra": ["metric", "operation"]},
+    "coverage_summary": {"tool": "get_coverage_summary", "zone_scoped": False, "takes_n": False, "extra": []},
+    "locate_area": {"tool": "locate_area", "zone_scoped": False, "takes_n": False, "extra": ["area_name"]},
+    "zone_details": {"tool": "get_zone_details", "zone_scoped": True, "takes_n": False, "extra": []},
+    "zone_peer_comparison": {"tool": "get_zone_peer_comparison", "zone_scoped": True, "takes_n": False, "extra": []},
+    "zone_trend": {"tool": "get_zone_trend", "zone_scoped": True, "takes_n": False, "extra": []},
+}
+
+_SEMANTIC_INTENT_DESCRIPTIONS = """\
+- priority_areas: which areas should be investigated, enhanced, improved, or focused on first \
+(a decision-maker asking where to act -- ranked by the Priority Score, which already combines \
+peer comparison, trend, anomalies, and population).
+- weakest_areas: where mobile experience is currently lowest/worst, as a plain ranking (not "what \
+should we act on").
+- strongest_areas: where mobile experience is currently highest/best.
+- deteriorating_areas: where experience has been getting WORSE OVER TIME / declining / \
+trending down over several recent quarters (a TREND question -- "worsening", "declining", \
+"getting worse", "experience is decreasing over time" all mean this, even with none of those \
+exact words). severity ("low"/"medium"/"high"), if the question names one, filters to that \
+exact severity of decline; without it, every currently-declining area is returned regardless \
+of how mild or severe. A superlative ("strongest"/"most severe decline") means rank-and-cap, \
+not a severity filter -- put the count in n instead and leave severity null.
+- anomalous_areas: kind="peer_gap" for a zone scoring unusually WORSE THAN ITS PEERS RIGHT NOW \
+-- this is also where everyday, non-technical phrasings belong: "not as good as similar areas", \
+"worse than comparable places", "underperforming compared with similar areas" all mean \
+kind="peer_gap", even though they never say the words "peer gap". kind="temporal" for unusual \
+vs. the SAME zone's own past/history (needs "over time"/"history"/"own past"/"temporal" wording \
+specifically -- otherwise assume peer_gap). severity ("low"/"medium"/"high") filters to that \
+exact severity if the question names one (e.g. "areas with HIGH temporal anomaly"); without \
+it, returns every zone the ML model actually flagged, regardless of severity. A superlative \
+("highest"/"strongest anomalies") means rank-and-cap by the real anomaly score -- put the \
+count in n and leave severity null (these are different questions: "areas that ARE anomalous" \
+vs. "the N most anomalous areas" vs. "areas that are HIGH severity").
+- population_exposure_weak_areas: weak experience where a large number of people are affected.
+- peer_group_filter: a plain categorical filter by the zone's development/land-use type -- \
+"industrial areas", "commercial areas", "residential areas", "rural areas". peer_group is \
+REQUIRED and must be exactly one of: "industrial", "commercial/urban-core", \
+"low-density residential", "rural/edge". Map an everyday synonym to the closest of these four \
+(e.g. "industry zones"/"industrial locations" -> "industrial"; "urban core"/"commercial \
+zones" -> "commercial/urban-core"; "residential"/"suburban" -> "low-density residential"; \
+"rural"/"edge areas"/"outskirts" -> "rural/edge") -- never invent a fifth category.
+- metric_threshold_areas: which areas are above/below the median for one raw measurement \
+(download, upload, or latency) -- metric + comparison ("above"/"below") required.
+- metric_extreme: the single lowest/highest/median value of one raw measurement (download, \
+upload, or latency) -- metric + operation ("min"/"max"/"median") required.
+- coverage_summary: how much of the population or area has enough measurements to be scored.
+- locate_area: show, find, or locate one specific named place on the map -- area_name required \
+(the place name exactly as the user wrote it, do not correct its spelling yourself).
+- clarify: the question is genuinely ambiguous between two or more of the above.
+- none: the question does not match any of the above at all (including anything about a specific \
+operator/site/root-cause -- that is refused before you are ever called, so if you see one here \
+treat it as "none").\
+"""
+
+_SEMANTIC_ZONE_INTENT_DESCRIPTIONS = """\
+- zone_details: why the currently-selected area was flagged, what is driving its Priority Score, \
+or its confidence/evidence level.
+- zone_peer_comparison: how the currently-selected area compares specifically to similar areas.
+- zone_trend: how the currently-selected area has changed over time.\
+"""
+
+
+def _build_semantic_system_prompt(zone_selected: bool) -> str:
+    zone_block = f"\n{_SEMANTIC_ZONE_INTENT_DESCRIPTIONS}" if zone_selected else ""
+    zone_note = (
+        " A specific area is currently selected on the map, so the zone_* intents below are "
+        "also available for a question about 'this area'/'here'/'this zone'."
+        if zone_selected else
+        " No specific area is currently selected, so do not choose a zone_* intent no matter how "
+        "the question is phrased."
+    )
+    return (
+        "You classify a decision-maker's free-text question into ONE of a fixed set of "
+        "supported analytics intents for a UAE mobile-network dashboard. You are NOT answering "
+        "the question and NOT computing any number, score, or ranking yourself -- a separate "
+        "deterministic tool does that from verified data; your only job is choosing WHICH tool "
+        "applies and its parameters, from the question's meaning. Paraphrases, unfamiliar "
+        "wording, and spelling mistakes should still map correctly if the underlying meaning "
+        "matches one of these -- e.g. 'which areas should I enhance for the future' means the "
+        "same thing as 'which areas should we investigate first' (priority_areas)."
+        + zone_note +
+        " Never invent an intent, parameter, or value outside exactly what is listed below; if "
+        "you are not sure a parameter applies, leave it null. Give your own honest confidence "
+        "(0.0-1.0) that the chosen intent is correct -- a low number is expected and fine for a "
+        "genuinely unclear question, and is what tells the system to ask the user to clarify "
+        "instead of guessing.\n\nIntents:\n" + _SEMANTIC_INTENT_DESCRIPTIONS + zone_block
+    )
+
+
+def _build_semantic_tool_schema(allowed_intents: list[str]) -> dict:
+    return {
+        "name": "classify_intent",
+        "description": "Classify the user's question into one supported analytics intent.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "intent": {"type": "string", "enum": allowed_intents},
+                "confidence": {
+                    "type": "number",
+                    "description": "Your own confidence (0.0-1.0) that this intent is correct.",
+                },
+                "n": {
+                    "type": ["integer", "null"],
+                    "description": "Explicit count of areas requested (e.g. 'top 3' -> 3), if any; else null.",
+                },
+                "metric": {"type": ["string", "null"], "enum": ["download_mbps", "upload_mbps", "latency_ms", None]},
+                "operation": {"type": ["string", "null"], "enum": ["min", "max", "median", None]},
+                "comparison": {"type": ["string", "null"], "enum": ["above", "below", None]},
+                "kind": {"type": ["string", "null"], "enum": ["peer_gap", "temporal", None]},
+                "severity": {
+                    "type": ["string", "null"],
+                    "enum": ["low", "medium", "high", None],
+                    "description": (
+                        "Only when the question names an exact severity band ('high'/'medium'/"
+                        "'low' deterioration or temporal/peer-gap anomaly). Null for a "
+                        "superlative ('highest'/'strongest'/'most severe') -- that means rank "
+                        "and cap by score instead, so put the count in `n` and leave this null."
+                    ),
+                },
+                "peer_group": {
+                    "type": ["string", "null"],
+                    "enum": ["industrial", "commercial/urban-core", "low-density residential", "rural/edge", None],
+                    "description": "Only for intent='peer_group_filter' -- the closest of these four canonical values.",
+                },
+                "area_name": {
+                    "type": ["string", "null"],
+                    "description": "The place name exactly as written in the question, only for intent='locate_area'.",
+                },
+                "clarify_suggestion": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Only for intent='clarify': a short, natural-language phrase a decision-"
+                        "maker would recognise, describing what you think they meant -- e.g. "
+                        "'the areas with the weakest experience' or 'the median download speed'. "
+                        "It will be inserted into \"Did you mean ...?\", so end it with no "
+                        "trailing question mark and never use an internal intent name (e.g. "
+                        "'coverage_summary') or any other snake_case identifier."
+                    ),
+                },
+            },
+            "required": ["intent", "confidence"],
+        },
+    }
+
+
+def _validate_semantic_output(raw: dict, allowed_intents: list[str], zone_id: str | None,
+                               question: str) -> dict:
+    """Every field the model returned, re-checked against the allowlist -- the model's own JSON
+    is never dispatched to a tool unexamined. Returns one of:
+      {'status': 'ok', 'tool': ..., 'tool_args': ..., 'intent': ..., 'confidence': ...}
+      {'status': 'clarify', 'suggestion': ...}
+      {'status': 'none'}   -- invalid, unrecognised, zone-scoped with no zone, or genuinely 'none'
+    `n`/`emirate` are deliberately NOT read from `raw` here -- see module note above; they come
+    from this file's own deterministic extractors over `question`, same as every other route."""
+    intent = raw.get("intent")
+    confidence = raw.get("confidence")
+    confidence = confidence if isinstance(confidence, (int, float)) else 0.0
+
+    if intent not in allowed_intents or intent == "none":
+        return {"status": "none"}
+    if intent == "clarify" or confidence < SEMANTIC_CONFIDENCE_THRESHOLD:
+        suggestion = raw.get("clarify_suggestion")
+        suggestion = suggestion if isinstance(suggestion, str) and suggestion.strip() else "rephrasing your question"
+        suggestion = suggestion.strip().rstrip("?").rstrip()  # this always gets wrapped in "Did you mean ...?" below
+        return {"status": "clarify", "suggestion": suggestion}
+
+    spec = SEMANTIC_INTENTS[intent]
+    if spec["zone_scoped"] and not zone_id:
+        return {"status": "none"}
+
+    if intent == "locate_area":
+        area_name = raw.get("area_name")
+        if not isinstance(area_name, str) or not area_name.strip():
+            return {"status": "none"}
+        tool_name, tool_args = _resolve_locate_phrase(area_name.strip(), _extract_emirate(question))
+        if tool_name in ("locate_area_not_found", "clarify"):
+            return {"status": tool_name, **tool_args}
+        return {"status": "ok", "tool": tool_name, "tool_args": tool_args, "intent": intent, "confidence": confidence}
+
+    tool_args: dict = {}
+    if spec["zone_scoped"]:
+        tool_args["zone_id"] = zone_id
+    else:
+        emirate = _extract_emirate(question)
+        if emirate:
+            tool_args["emirate"] = emirate
+        if spec["takes_n"]:
+            n = _extract_explicit_n(question)
+            if n is not None:
+                tool_args["n"] = n
+
+    for field in spec["extra"]:
+        if field in ("kind", "severity"):
+            continue  # both handled below, deterministically -- never trusted from the model
+        value = raw.get(field)
+        valid_values = {
+            "metric": ("download_mbps", "upload_mbps", "latency_ms"),
+            "operation": ("min", "max", "median"),
+            "comparison": ("above", "below"),
+            "peer_group": ct.PEER_GROUPS,
+        }[field]
+        if value not in valid_values:
+            return {"status": "none"}  # a required parameter for this intent didn't validate
+        tool_args[field] = value
+    if "kind" in spec["extra"]:
+        kind = raw.get("kind")
+        tool_args["kind"] = kind if kind in ("peer_gap", "temporal") else "peer_gap"
+        # Deterministic override (2026-09-17), same fix and same reasoning as route()'s own
+        # anomalous-areas branch: a literal "temporal"/"history"/"own past"/"over time" in the
+        # question wins over whatever the model itself guessed -- this is a simple, reliably
+        # parseable signal, so it is resolved the same way n/emirate always are here, never left
+        # to the model's own judgment.
+        if re.search(r"\btemporal\b|\bhistory|own past|over time\b", question.lower()):
+            tool_args["kind"] = "temporal"
+    if "severity" in spec["extra"]:
+        # Also deterministic, same reasoning -- "high/medium/low" and "highest/strongest/top N"
+        # are simple, closed word classes route() already resolves the same way; the model's
+        # own 'severity' field is intentionally never read here.
+        if _wants_severity_ranking(question):
+            tool_args["n"] = tool_args.get("n") or _extract_explicit_n(question) or 5
+        else:
+            severity = _resolve_severity_band(question)
+            if severity:
+                tool_args["severity"] = severity
+
+    return {"status": "ok", "tool": spec["tool"], "tool_args": tool_args, "intent": intent, "confidence": confidence}
+
+
+def classify_intent_semantic(question: str, zone_id: str | None = None) -> dict:
+    """The semantic fallback itself. Always returns a dict with a 'status' key
+    ('ok' | 'clarify' | 'none' | 'unavailable' | 'error') plus a 'usage' key (input_tokens/
+    output_tokens, or None if no API call was made) -- so a caller can always tell exactly what
+    happened and log/display real token usage, never a guess. Never raises: any exception from
+    the API call itself is caught and reported as status='error', same "fall back, don't crash
+    the demo" contract `narrate()` already uses for the narration-stage LLM call."""
+    if not _llm_available():
+        return {"status": "unavailable", "usage": None}
+    try:
+        import anthropic  # imported lazily, same as _llm_narrate -- module loads without it installed
+    except ImportError:
+        return {"status": "unavailable", "usage": None}
+
+    allowed_intents = [name for name, spec in SEMANTIC_INTENTS.items()
+                       if zone_id is not None or not spec["zone_scoped"]] + ["clarify", "none"]
+
+    try:
+        client = anthropic.Anthropic()
+        message = client.messages.create(
+            model=SEMANTIC_MODEL,
+            max_tokens=SEMANTIC_MAX_TOKENS,
+            system=_build_semantic_system_prompt(zone_id is not None),
+            tools=[_build_semantic_tool_schema(allowed_intents)],
+            tool_choice={"type": "tool", "name": "classify_intent"},
+            messages=[{"role": "user", "content": question}],
+        )
+    except Exception as exc:
+        return {"status": "error", "usage": None, "error": str(exc)}
+
+    usage = {"input_tokens": message.usage.input_tokens, "output_tokens": message.usage.output_tokens}
+    tool_use = next((block for block in message.content if block.type == "tool_use"), None)
+    if tool_use is None:
+        return {"status": "error", "usage": usage, "error": "model returned no tool_use block"}
+
+    result = _validate_semantic_output(tool_use.input, allowed_intents, zone_id, question)
+    result["usage"] = usage
+    result["raw_model_output"] = tool_use.input
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -804,7 +1339,6 @@ SYSTEM_PROMPT = (
     "6) This is public, outside-in mobile measurement data with no operator attribution -- "
     "never attribute a result to e& or any specific operator, site, or tower."
 )
-
 
 def _llm_available() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY"))
@@ -904,14 +1438,25 @@ def _strongest_listing_narration(n: int, quarter: str, emirate: str | None) -> s
     return f"{lead} the {n} areas with the highest measured mobile experience{where}. I highlighted {pronoun} on the map."
 
 
-def _deteriorating_listing_narration(n: int, quarter: str, emirate: str | None) -> str:
+def _severity_clause(question: str) -> str:
+    """' (high severity)' / ' (medium severity)' / ' (low severity)' / '' -- re-resolved from
+    the question text (same pattern _metric_threshold_listing_narration already uses for its
+    own metric/comparison), so the narration names the severity it actually filtered on
+    whenever the question named one, without route() having to thread it through separately."""
+    severity = _resolve_severity_band(question)
+    return f" ({severity} severity)" if severity else ""
+
+
+def _deteriorating_listing_narration(question: str, n: int, quarter: str, emirate: str | None) -> str:
     where = _scope_suffix(emirate)
+    severity = _severity_clause(question)
+    persistence = f"{CONSECUTIVE_DECLINES_REQUIRED}+ quarters in a row"
     if n == 1:
-        return (f"This area{where} has been getting worse over time compared with similar areas, "
-                f"for at least three quarters in a row (as of {quarter}). I highlighted it on the map.")
+        return (f"This area{where} has been getting worse over time compared with the national trend, "
+                f"for at least {persistence} (as of {quarter}){severity}. I highlighted it on the map.")
     lead, pronoun = _lead(n)
     return (f"{lead} {n} areas{where} where performance has been getting worse over time compared "
-            f"with similar areas, for at least three quarters in a row (as of {quarter}). "
+            f"with the national trend, for at least {persistence} (as of {quarter}){severity}. "
             f"I highlighted {pronoun} on the map.")
 
 
@@ -919,9 +1464,18 @@ def _anomalous_listing_narration(question: str, n: int, quarter: str, emirate: s
     lead, pronoun = _lead(n)
     subject = "one area" if n == 1 else f"{n} areas"
     where = _scope_suffix(emirate)
-    is_temporal = bool(re.search(r"\bhistory|own past|over time\b", question.lower()))
+    is_temporal = bool(re.search(r"\btemporal\b|\bhistory|own past|over time\b", question.lower()))
     clause = "compared with their own recent history" if is_temporal else "compared with similar areas"
-    return f"{lead} {subject}{where} showing unusual recent changes {clause}, in {quarter}. I highlighted {pronoun} on the map."
+    return (f"{lead} {subject}{where} showing unusual recent changes {clause}, in {quarter}"
+            f"{_severity_clause(question)}. I highlighted {pronoun} on the map.")
+
+
+def _peer_group_listing_narration(question: str, n: int, quarter: str, emirate: str | None) -> str:
+    lead, pronoun = _lead(n)
+    subject = "one area" if n == 1 else f"{n} areas"
+    where = _scope_suffix(emirate)
+    peer_group = _resolve_peer_group(question) or "that type"
+    return f"{lead} {subject}{where} classified as {peer_group}, in {quarter}. I highlighted {pronoun} on the map."
 
 
 def _high_population_weak_listing_narration(n: int, quarter: str, emirate: str | None) -> str:
@@ -956,9 +1510,10 @@ _LISTING_NARRATORS = {
     "get_priority_zones": lambda q, n, quarter, emirate: _priority_listing_narration(n, quarter, emirate),
     "get_weakest_zones": lambda q, n, quarter, emirate: _weakest_listing_narration(n, quarter, emirate),
     "get_strongest_zones": lambda q, n, quarter, emirate: _strongest_listing_narration(n, quarter, emirate),
-    "get_deteriorating_zones": lambda q, n, quarter, emirate: _deteriorating_listing_narration(n, quarter, emirate),
+    "get_deteriorating_zones": lambda q, n, quarter, emirate: _deteriorating_listing_narration(q, n, quarter, emirate),
     "get_anomalous_zones": lambda q, n, quarter, emirate: _anomalous_listing_narration(q, n, quarter, emirate),
     "get_high_population_weak_zones": lambda q, n, quarter, emirate: _high_population_weak_listing_narration(n, quarter, emirate),
+    "get_zones_by_peer_group": lambda q, n, quarter, emirate: _peer_group_listing_narration(q, n, quarter, emirate),
     "get_metric_threshold_zones": lambda q, n, quarter, emirate: _metric_threshold_listing_narration(q, n, quarter, emirate),
 }
 
@@ -1086,7 +1641,7 @@ def _template_narrate(question: str, tool_name: str, tool_result, tool_args: dic
         area_name, area_emirate = tool_result[0]["area_name"], tool_result[0]["emirate"]
         return f"Here is {area_name} in {area_emirate}. I highlighted it on the map."
 
-    return "I could not map this question to a supported tool. Try one of the ten canonical questions."
+    return UNMATCHED_MESSAGE
 
 
 def narrate(question: str, tool_name: str, tool_result, tool_args: dict | None = None) -> tuple[str, str]:
@@ -1108,6 +1663,11 @@ def narrate(question: str, tool_name: str, tool_result, tool_args: dict | None =
 # ---------------------------------------------------------------------------
 
 def answer_question(question: str, zone_id: str | None = None, quarter: str | None = None) -> dict:
+    greeting = check_greeting(question)
+    if greeting:
+        return {"question": question, "tool": None, "tool_args": None, "tool_result": None,
+                "answer": greeting, "mode": "greeting"}
+
     refusal = check_refusal(question)
     if refusal:
         return {"question": question, "tool": None, "tool_args": None, "tool_result": None,
@@ -1119,22 +1679,41 @@ def answer_question(question: str, zone_id: str | None = None, quarter: str | No
                 "answer": data_source_answer, "mode": "fixed_fact"}
 
     tool_name, tool_args = route(question, zone_id)
+    routing = {"path": "deterministic"}
     if tool_name == "unmatched":
-        return {"question": question, "tool": None, "tool_args": None, "tool_result": None,
-                "answer": "I could not map this question to a supported tool. Try one of the "
-                          "ten canonical questions.", "mode": "unmatched"}
+        # Deterministic keyword routing found nothing -- try the semantic (LLM) classifier
+        # before giving up. Never runs on, and never overrides, a confident deterministic match
+        # above; only reached on the exact same "unmatched" path that used to dead-end here.
+        semantic = classify_intent_semantic(question, zone_id)
+        routing = {"path": "semantic", **{k: v for k, v in semantic.items() if k != "raw_model_output"}}
+        if semantic["status"] == "ok":
+            tool_name, tool_args = semantic["tool"], semantic["tool_args"]
+        elif semantic["status"] == "clarify":
+            return {"question": question, "tool": None, "tool_args": None, "tool_result": None,
+                    "answer": f"Did you mean {semantic['suggestion']}?", "mode": "clarification",
+                    "routing": routing}
+        elif semantic["status"] == "locate_area_not_found":
+            return {"question": question, "tool": None, "tool_args": None, "tool_result": None,
+                    "answer": AREA_NOT_FOUND_MESSAGE, "mode": "area_not_found", "routing": routing}
+        else:
+            # 'none' (didn't validate / not one of ours), 'unavailable' (no LLM connected), or
+            # 'error' (API call itself failed) -- all fall back to the same honest message a
+            # deterministic miss already gives, never a guess.
+            return {"question": question, "tool": None, "tool_args": None, "tool_result": None,
+                    "answer": UNMATCHED_MESSAGE, "mode": "unmatched", "routing": routing}
     if tool_name == "locate_area_not_found":
         # A locate-style question was detected (e.g. "show me X") but nothing in the processed
         # area-name universe matched confidently enough -- an honest "not found," never a guess.
         return {"question": question, "tool": None, "tool_args": None, "tool_result": None,
-                "answer": AREA_NOT_FOUND_MESSAGE, "mode": "area_not_found"}
+                "answer": AREA_NOT_FOUND_MESSAGE, "mode": "area_not_found", "routing": routing}
     if tool_name == "clarify":
         # A metric/typo match was found but confidence was below _CONFIDENCE_THRESHOLD -- ask
         # rather than guess. No tool ran, so tool_result stays None; the map is untouched (the
         # frontend only ever moves the map from a tool's own zone_id field(s), and there isn't
         # one here).
         return {"question": question, "tool": None, "tool_args": None, "tool_result": None,
-                "answer": f"Did you mean {tool_args['suggestion']}?", "mode": "clarification"}
+                "answer": f"Did you mean {tool_args['suggestion']}?", "mode": "clarification",
+                "routing": routing}
 
     if quarter and "quarter" in _TOOLS[tool_name].__code__.co_varnames:
         tool_args = {**tool_args, "quarter": quarter}
@@ -1143,7 +1722,7 @@ def answer_question(question: str, zone_id: str | None = None, quarter: str | No
     tool_result = _TOOLS[tool_name](**tool_args)
     answer, mode = narrate(question, tool_name, tool_result, tool_args)
     result = {"question": question, "tool": tool_name, "tool_args": tool_args,
-              "tool_result": tool_result, "answer": answer, "mode": mode}
+              "tool_result": tool_result, "answer": answer, "mode": mode, "routing": routing}
     if tool_name == "locate_area" and tool_result and not tool_result[0].get("error"):
         # Structured, top-level fields for a locate_area answer -- the frontend highlights from
         # h3_ids directly (never parsed from `answer`'s prose), matching the same "map is driven

@@ -99,6 +99,15 @@ def _summary_row(row: pd.Series) -> dict:
         "population": int(row["population"]),
         "priority_score": _num(row["priority_score"]),
         "priority_zone": bool(row["priority_zone"]),
+        # Severity bands (2026-09-17) -- null for 'low'-tier rows (no Priority Score/factors
+        # computed at all for that tier), never guessed. Exposed here, not just buried in
+        # `get_zone_details`, so any listing tool's caller (narration or a test) can verify
+        # *which* severity a returned zone actually has, rather than assuming a flag and a
+        # band always coincide.
+        "deteriorating": bool(row["deteriorating"]),
+        "deterioration_band": _band(row["deterioration_band"]),
+        "peer_gap_band": _band(row["peer_gap_band"]),
+        "temporal_anomaly_band": _band(row["temporal_anomaly_band"]),
         "evidence_status": "scored",
     }
 
@@ -290,23 +299,36 @@ def get_strongest_zones(n: int = 10, quarter: str | None = None, emirate: str | 
     return _experience_ranked(False, n, quarter, emirate)
 
 
-def get_deteriorating_zones(quarter: str | None = None, emirate: str | None = None,
-                             scope: str = "current", n: int | None = None) -> list[dict]:
-    """`scope="current"` (default): zones whose *this-quarter* flag closed a 3+ quarter
-    decline -- "which areas are deteriorating right now." `scope="ever_in_window"`: any zone
-    that hit this pattern at least once across all 8 quarters -- a broader, historical count.
-    These are genuinely different questions; keeping them as separate, named parameters
-    (rather than one ambiguous "deteriorating zones" list) is deliberate.
+_VALID_SEVERITIES = ("low", "medium", "high")
 
-    `n`, when given, narrows the (already-flagged) result to the N strongest current-quarter
-    cases, ranked by `trend_pts_per_qtr` ascending (most negative = fastest decline vs. peers).
-    `src/priority.py`'s own `factor_deterioration` can't be used for this ranking -- it's a
-    percentile rank of the boolean `deteriorating` flag, so every deteriorating zone in a
-    quarter ties at the same value by construction; `trend_pts_per_qtr` (from src/trends.py,
-    already computed, unmodified here) is the only continuous severity signal available. `n`
-    only narrows which already-flagged zones come back -- it never changes who counts as
-    deteriorating, and never touches the Priority Score itself. `n=None` (the default) keeps
-    every flagged zone, unranked, exactly as before."""
+
+def get_deteriorating_zones(quarter: str | None = None, emirate: str | None = None,
+                             scope: str = "current", n: int | None = None,
+                             severity: str | None = None) -> list[dict]:
+    """`scope="current"` (default): zones whose *this-quarter* flag closed a persistent
+    national-relative decline -- "which areas are deteriorating right now." `scope=
+    "ever_in_window"`: any zone that hit this pattern at least once across all 8 quarters -- a
+    broader, historical count. These are genuinely different questions; keeping them as
+    separate, named parameters (rather than one ambiguous "deteriorating zones" list) is
+    deliberate.
+
+    `severity` ('low'/'medium'/'high', 2026-09-17), when given, narrows the result to zones
+    whose `deterioration_band` matches exactly -- "areas with HIGH deterioration," a different
+    question from "areas that ARE deteriorating" (this tool's own default, severity-blind
+    behavior). Always applied on top of the `deteriorating` gate above, never instead of it --
+    `deterioration_band` alone is NOT a safe filter by itself: a non-deteriorating zone (zero
+    magnitude) also bands 'Low' by construction (see src/priority.py), so filtering on the band
+    without the gate would silently pull in zones that were never flagged as deteriorating at
+    all. Only meaningful with `scope="current"` (deterioration_band is a current-quarter
+    Priority factor, not a historical-window concept).
+
+    `n`, when given, narrows the (already-flagged, and already severity-filtered if `severity`
+    was given) result to the N strongest current-quarter cases, ranked by `trend_pts_per_qtr`
+    ascending (most negative = fastest ABSOLUTE decline). Kept as the existing, unchanged
+    ranking field here -- `severity`/`deterioration_band` above is the new, correct way to ask
+    for "how severe," so `n`'s own ranking basis is intentionally left alone rather than
+    re-derived as part of this change. `n=None` (the default) keeps every matching zone,
+    unranked, exactly as before."""
     if scope == "ever_in_window":
         df = _load()
         sub = df[~df["insufficient_evidence"]]
@@ -322,21 +344,88 @@ def get_deteriorating_zones(quarter: str | None = None, emirate: str | None = No
         return [_summary_row(r) for _, r in latest_rows.iterrows()]
     sub, quarter = _classified(quarter, emirate)
     flagged = sub[sub["deteriorating"]]
+    if severity is not None:
+        if severity not in _VALID_SEVERITIES:
+            return [{"error": f"unknown severity '{severity}', expected one of {_VALID_SEVERITIES}"}]
+        flagged = flagged[flagged["deterioration_band"].astype(str).str.lower() == severity]
     if n is not None:
         flagged = flagged.sort_values("trend_pts_per_qtr", ascending=True).head(n)
     return [_summary_row(r) for _, r in flagged.iterrows()]
 
 
-def get_anomalous_zones(kind: str, quarter: str | None = None, emirate: str | None = None) -> list[dict]:
+_ANOMALY_KIND_COLUMNS = {
+    "peer_gap": {"flag": "peer_gap_ml_anomaly", "band": "peer_gap_band", "factor": "factor_peer_gap"},
+    "temporal": {"flag": "temporal_anomaly_ml_flag", "band": "temporal_anomaly_band", "factor": "factor_temporal_anomaly"},
+}
+
+
+def get_anomalous_zones(kind: str, quarter: str | None = None, emirate: str | None = None,
+                         severity: str | None = None, n: int | None = None) -> list[dict]:
     """`kind="peer_gap"`: unusual vs. comparable peers, right now (Isolation Forest #1).
     `kind="temporal"`: unusual vs. its own history (Isolation Forest #2). These are the two
-    analytically distinct ML outputs the brief requires -- never conflate them."""
-    col = {"peer_gap": "peer_gap_ml_anomaly", "temporal": "temporal_anomaly_ml_flag"}.get(kind)
-    if col is None:
+    analytically distinct ML outputs the brief requires -- never conflate them.
+
+    Three independent questions this tool answers, never conflated (2026-09-17):
+      - Neither `severity` nor `n` given (the original, unchanged default): "areas WITH a
+        temporal/peer-gap anomaly" -- the ML detector's own flagged set
+        (`temporal_anomaly_ml_flag` / `peer_gap_ml_anomaly`), severity-blind.
+      - `severity` ('low'/'medium'/'high') given: "areas with HIGH temporal anomaly" -- a
+        DIFFERENT, band-based question. Filters on the zone's own `temporal_anomaly_band` /
+        `peer_gap_band` (the continuous Priority-factor severity, percentile-ranked among all
+        classified zones every quarter -- not the ML flag's top-~8%-contamination cutoff, and
+        not guaranteed to be the same set). This is the fix for a real bug: the ML-flagged set
+        and the "High"-banded set usually overlap heavily but are not defined to be identical,
+        so a caller asking specifically for severity must filter on the band, never quietly
+        substitute the flag for it.
+      - `n` given (with or without `severity`): "highest/strongest N [temporal/peer-gap]
+        anomalies" -- ranks by the zone's own continuous factor score
+        (`factor_temporal_anomaly` / `factor_peer_gap`) descending and caps at N. Without
+        `severity`, ranks the WHOLE classified population by score (not just the ML-flagged
+        subset) -- the flagged set and the true top-N by score are usually the same zones, but
+        this asks for the actual top N by magnitude, not an approximation of it."""
+    cols = _ANOMALY_KIND_COLUMNS.get(kind)
+    if cols is None:
         return [{"error": f"unknown kind '{kind}', expected 'peer_gap' or 'temporal'"}]
     sub, quarter = _classified(quarter, emirate)
-    flagged = sub[sub[col]]
-    return [_summary_row(r) for _, r in flagged.iterrows()]
+    if severity is not None:
+        if severity not in _VALID_SEVERITIES:
+            return [{"error": f"unknown severity '{severity}', expected one of {_VALID_SEVERITIES}"}]
+        candidates = sub[sub[cols["band"]].astype(str).str.lower() == severity]
+    elif n is not None:
+        candidates = sub
+    else:
+        candidates = sub[sub[cols["flag"]]]
+    if n is not None:
+        candidates = candidates.sort_values(cols["factor"], ascending=False, na_position="last").head(n)
+    return [_summary_row(r) for _, r in candidates.iterrows()]
+
+
+# The composite land-use classifier's 4 stable groups (notebooks/09_peer_group_classifier.ipynb
+# -- population/building/POI/road density, never a single OSM land-use tag; see
+# project_gt_challenge memory for why). The exact strings stored in `peer_group` -- kept here as
+# the one place that spells them, so `src/copilot.py`'s alias table can't drift from what's
+# actually in the data.
+PEER_GROUPS = ("industrial", "commercial/urban-core", "low-density residential", "rural/edge")
+
+
+def get_zones_by_peer_group(peer_group: str, quarter: str | None = None, emirate: str | None = None,
+                             n: int | None = None) -> list[dict]:
+    """Every classified zone in the given composite peer group (2026-09-17) -- "show me
+    industrial areas" / "which zones are commercial" -- a plain categorical filter, not a
+    ranking. `peer_group` must be one of `PEER_GROUPS` exactly (resolving a user's free-text
+    phrasing, e.g. "industry zones", down to one of these four canonical values is
+    src/copilot.py's `route()`/semantic classifier's job, before this tool is ever called --
+    same contract every other tool here already has for its own arguments). `n`, when given,
+    narrows to the N weakest zones in that peer group by Experience Index (the one ranking
+    every other listing tool in this file already defaults to) -- omitted (the default) returns
+    every zone in that peer group, unranked."""
+    if peer_group not in PEER_GROUPS:
+        return [{"error": f"unknown peer_group '{peer_group}', expected one of {PEER_GROUPS}"}]
+    sub, quarter = _classified(quarter, emirate)
+    candidates = sub[sub["peer_group"] == peer_group]
+    if n is not None:
+        candidates = candidates.sort_values("experience_index", ascending=True).head(n)
+    return [_summary_row(r) for _, r in candidates.iterrows()]
 
 
 def get_high_population_weak_zones(n: int = 10, quarter: str | None = None, emirate: str | None = None) -> list[dict]:
@@ -563,9 +652,12 @@ _METHODOLOGY = {
                    "never the UAE-wide distribution).",
     },
     "trend": {
-        "formula": f"A zone is flagged 'deteriorating' once its Peer Gap has declined for "
-                   f"{CONSECUTIVE_DECLINES_REQUIRED} consecutive quarters -- relative to its "
-                   f"peer group, never raw Mbps, and never on a single bad quarter.",
+        "formula": f"A zone is flagged 'deteriorating' once its gap to the national median "
+                   f"Experience Index has widened for {CONSECUTIVE_DECLINES_REQUIRED} consecutive "
+                   f"quarters -- relative to the national trend, never raw Mbps, and never on a "
+                   f"single bad quarter. The Deterioration factor used in Priority is continuous: "
+                   f"zero unless that persistence bar is cleared, then scaled by how severe the "
+                   f"relative decline is compared to other currently-deteriorating zones.",
         "consecutive_declines_required": CONSECUTIVE_DECLINES_REQUIRED,
     },
     "priority_score": {
